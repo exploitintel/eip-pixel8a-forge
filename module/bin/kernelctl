@@ -1,0 +1,584 @@
+#!/system/bin/sh
+# Root-only active-boot kernel controller. Every partition write is bound to
+# the generated installer records, the active slot, and paired payload/full
+# partition identities. It never addresses an inactive slot or another AVB
+# partition.
+set -u
+set -f
+# Android's mksh and the host test shell both support pipefail. It is required
+# so a failed direct-I/O reader cannot be hidden by a successful hasher.
+# shellcheck disable=SC3040
+set -o pipefail
+
+PROGRAM=kernelctl
+ATTENTION_STATUS=3
+BUSYBOX=/data/adb/ksu/bin/busybox
+BOOT_DEVICE_ROOT=/dev/block/by-name
+BATTERY_CAPACITY=/sys/class/power_supply/battery/capacity
+DOCKER_ROOT=/data/docker
+RUN_ROOT=$DOCKER_ROOT/run
+KERNEL_ROOT=$DOCKER_ROOT/kernel
+BACKUP_ROOT=$DOCKER_ROOT/boot-backup
+LOCK_DIR=$RUN_ROOT/host-lifecycle.lock
+LOCK_OWNER=$LOCK_DIR/pid
+SPACE_RESERVE_BYTES=268435456
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/*}
+INPUTS=$MODDIR/installer-inputs.tsv
+PREFLIGHT=$MODDIR/bin/install-preflight
+SWAP_BOOT_KERNEL=$MODDIR/bin/swap-boot-kernel
+LOCK_OWNED=0
+PARTITION_WRITE_POSSIBLE=0
+TEMP_BACKUP=
+TEMP_METADATA=
+
+usage() {
+  printf '%s\n' \
+    'usage: kernelctl status' \
+    '       kernelctl install INSTALL:BUILD_ID:_a|_b' \
+    '       kernelctl restore RESTORE:BUILD_ID:_a|_b' >&2
+  exit 2
+}
+
+fail() {
+  printf '%s: %s\n' "$PROGRAM" "$1" >&2
+  if [ "$PARTITION_WRITE_POSSIBLE" = 1 ]; then
+    recovery_required
+  fi
+  exit "${2:-1}"
+}
+
+bb() {
+  "$BUSYBOX" "$@"
+}
+
+path_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+valid_sha256() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+canonical_unsigned() {
+  case "$1" in 0|[1-9]* ) ;; *) return 1 ;; esac
+  case "$1" in *[!0-9]*) return 1 ;; esac
+}
+
+boot_device_is_expected_type() {
+  [ -b "$1" ]
+}
+
+# Invoked through EXIT and signal traps.
+# shellcheck disable=SC2329
+cleanup() {
+  if [ -n "$TEMP_BACKUP" ] && path_exists "$TEMP_BACKUP"; then
+    bb rm -f "$TEMP_BACKUP" 2>/dev/null || true
+  fi
+  TEMP_BACKUP=
+  if [ -n "$TEMP_METADATA" ] && path_exists "$TEMP_METADATA"; then
+    bb rm -f "$TEMP_METADATA" 2>/dev/null || true
+  fi
+  TEMP_METADATA=
+  [ "$LOCK_OWNED" = 1 ] || return 0
+  if [ -f "$LOCK_OWNER" ] && [ ! -L "$LOCK_OWNER" ] &&
+     [ "$(bb cat "$LOCK_OWNER" 2>/dev/null || true)" = "$$" ]; then
+    bb rm -f "$LOCK_OWNER" 2>/dev/null || true
+    bb rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  LOCK_OWNED=0
+}
+
+# Invoked through signal traps.
+# shellcheck disable=SC2329
+signal_exit() {
+  SIGNAL_STATUS=$1
+  if [ "$PARTITION_WRITE_POSSIBLE" = 1 ]; then
+    trap - HUP INT TERM
+    recovery_required
+  fi
+  trap - EXIT HUP INT TERM
+  cleanup
+  exit "$SIGNAL_STATUS"
+}
+
+recovery_required() {
+  printf '%s\n' \
+    "$PROGRAM: RECOVERY REQUIRED: the active boot partition may be incomplete; do not reboot" \
+    "$PROGRAM: active-slot fastboot recovery guidance:" \
+    "$PROGRAM:   fastboot flash boot${SLOT_SUFFIX} <exact-known-good-boot.img>" >&2
+  exit "$ATTENTION_STATUS"
+}
+
+hash_file() {
+  HASH_PATH=$1
+  HASH_LINE=$(bb sha256sum "$HASH_PATH" 2>/dev/null) || return 1
+  HASH_OLD_IFS=$IFS
+  IFS=' '
+  # Word splitting is intentional after pathname expansion has been disabled.
+  # shellcheck disable=SC2086
+  set -- $HASH_LINE
+  IFS=$HASH_OLD_IFS
+  [ "$#" -eq 2 ] && [ "$2" = "$HASH_PATH" ] && valid_sha256 "$1" || return 1
+  HASH_VALUE=$1
+}
+
+direct_hash_file() {
+  DIRECT_HASH_LINE=$(bb dd if="$1" bs=1048576 iflag=direct 2>/dev/null | bb sha256sum - 2>/dev/null) \
+    || return 1
+  DIRECT_OLD_IFS=$IFS
+  IFS=' '
+  # shellcheck disable=SC2086
+  set -- $DIRECT_HASH_LINE
+  IFS=$DIRECT_OLD_IFS
+  [ "$#" -eq 2 ] && [ "$2" = - ] && valid_sha256 "$1" || return 1
+  DIRECT_HASH_VALUE=$1
+}
+
+file_size() {
+  FILE_SIZE=$(bb stat -c '%s' "$1" 2>/dev/null) || return 1
+  canonical_unsigned "$FILE_SIZE"
+}
+
+hash_inputs() {
+  [ -f "$INPUTS" ] && [ ! -L "$INPUTS" ] || return 1
+  hash_file "$INPUTS" || return 1
+  INPUT_HASH=$HASH_VALUE
+}
+
+normalize_ksu_version() {
+  NORMALIZED_KSU_VERSION=${KSU_VER:-}
+  case "$NORMALIZED_KSU_VERSION" in v*) NORMALIZED_KSU_VERSION=${NORMALIZED_KSU_VERSION#v} ;; esac
+  case "$NORMALIZED_KSU_VERSION" in
+    ''|*[!0-9.]*) return 1 ;;
+  esac
+}
+
+classify_active_boot() {
+  hash_inputs || fail 'cannot hash installer inputs'
+  CLASSIFY_INPUT_HASH=$INPUT_HASH
+  PREFLIGHT_OUTPUT=$("$PREFLIGHT" --runtime) || fail 'active boot preflight refused this host'
+  hash_inputs || fail 'cannot rehash installer inputs after preflight'
+  [ "$INPUT_HASH" = "$CLASSIFY_INPUT_HASH" ] \
+    || fail 'installer inputs changed during active boot preflight'
+  TAB=$(printf '\t')
+  # install-preflight validates the complete generated grammar. Parse its
+  # deliberately tiny result again so it cannot smuggle extra state here.
+  # The single-quoted program is passed to awk; shell expansion is not intended.
+  # shellcheck disable=SC2016
+  PREFLIGHT_FIELDS=$(printf '%s\n' "$PREFLIGHT_OUTPUT" | bb awk -F = \
+    -v tab="$TAB" -v expected_inputs="$CLASSIFY_INPUT_HASH" '
+    NR == 1 { if (NF != 2 || $1 != "INSTALL_PREFLIGHT_VERSION" || $2 != "1") exit 1; next }
+    NR == 2 { if (NF != 2 || $1 != "module_version" || $2 !~ /^[A-Za-z0-9][A-Za-z0-9._+-]*$/) exit 1; next }
+    NR == 3 { if (NF != 2 || $1 != "build_id" || $2 !~ /^[A-Z0-9.]+$/) exit 1; build=$2; next }
+    NR == 4 { if (NF != 2 || $1 != "slot_suffix" || ($2 != "_a" && $2 != "_b")) exit 1; slot=$2; next }
+    NR == 5 { if (NF != 2 || $1 != "boot_state" || $2 !~ /^[a-z][a-z0-9-]*$/) exit 1; state=$2; next }
+    NR == 6 { if (NF != 2 || $1 != "installer_inputs_sha256" || $2 != expected_inputs) exit 1; next }
+    { exit 1 }
+    END { if (NR != 6 || build == "" || slot == "" || state == "") exit 1; print build tab slot tab state }
+  ') || fail 'active boot preflight output is malformed'
+  OLD_IFS=$IFS
+  IFS=$TAB
+  # shellcheck disable=SC2086
+  set -- $PREFLIGHT_FIELDS
+  IFS=$OLD_IFS
+  [ "$#" -eq 3 ] || fail 'active boot preflight selection is malformed'
+  BUILD_ID=$1
+  SLOT_SUFFIX=$2
+  BOOT_STATE=$3
+  normalize_ksu_version || fail 'KernelSU version is invalid'
+
+  # shellcheck disable=SC2016
+  CONTEXT=$(bb awk -F "$TAB" \
+    -v tab="$TAB" -v build="$BUILD_ID" -v role="$BOOT_STATE" \
+    -v ksu_version="$NORMALIZED_KSU_VERSION" '
+    $1 == "BUILD" && $2 == build {
+      if (NF != 13) exit 1
+      builds++; partition=$8; image_name=$13
+    }
+    $1 == "KSU" && $2 == build && $3 == "lkm" && $4 == ksu_version { ksu++ }
+    $1 == "BOOT_STATE" && $2 == build && $3 == role {
+      if (NF != 7) exit 1
+      selected++; source_payload_size=$4; source_payload_hash=$5
+      source_full_size=$6; source_full_hash=$7
+    }
+    $1 == "BOOT_STATE" && $2 == build && $3 == "current-public" {
+      if (NF != 7) exit 1
+      public++; public_payload_size=$4; public_payload_hash=$5
+      public_full_size=$6; public_full_hash=$7
+    }
+    END {
+      if (builds != 1 || ksu != 1 || selected != 1 || public != 1 ||
+          image_name != "Image-" build ".lz4" || partition != source_full_size ||
+          partition != public_full_size) exit 1
+      print partition tab source_payload_size tab source_payload_hash tab \
+            source_full_size tab source_full_hash tab public_payload_size tab \
+            public_payload_hash tab public_full_size tab public_full_hash
+    }
+  ' "$INPUTS") || fail 'installer inputs do not contain one bound kernel context'
+  hash_inputs || fail 'cannot rehash installer inputs after kernel selection'
+  [ "$INPUT_HASH" = "$CLASSIFY_INPUT_HASH" ] \
+    || fail 'installer inputs changed during kernel selection'
+  OLD_IFS=$IFS
+  IFS=$TAB
+  # shellcheck disable=SC2086
+  set -- $CONTEXT
+  IFS=$OLD_IFS
+  [ "$#" -eq 9 ] || fail 'selected kernel context is malformed'
+  PARTITION_SIZE=$1
+  SOURCE_PAYLOAD_SIZE=$2
+  SOURCE_PAYLOAD_HASH=$3
+  SOURCE_FULL_SIZE=$4
+  SOURCE_FULL_HASH=$5
+  PUBLIC_PAYLOAD_SIZE=$6
+  PUBLIC_PAYLOAD_HASH=$7
+  PUBLIC_FULL_SIZE=$8
+  PUBLIC_FULL_HASH=$9
+  BOOT_DEVICE=$BOOT_DEVICE_ROOT/boot$SLOT_SUFFIX
+  boot_device_is_expected_type "$BOOT_DEVICE" \
+    || fail 'active boot path is not a block device'
+  STAGED_IMAGE=$KERNEL_ROOT/$BUILD_ID/Image.lz4
+}
+
+staged_image_state() {
+  STAGED_STATE=missing
+  [ -d "$KERNEL_ROOT" ] && [ ! -L "$KERNEL_ROOT" ] || return 0
+  [ -d "$KERNEL_ROOT/$BUILD_ID" ] && [ ! -L "$KERNEL_ROOT/$BUILD_ID" ] || return 0
+  path_exists "$STAGED_IMAGE" || return 0
+  STAGED_STATE=invalid
+  [ -f "$STAGED_IMAGE" ] && [ ! -L "$STAGED_IMAGE" ] || return 0
+  file_size "$STAGED_IMAGE" || return 0
+  [ "$FILE_SIZE" = "$PUBLIC_PAYLOAD_SIZE" ] || return 0
+  hash_file "$STAGED_IMAGE" || return 0
+  [ "$HASH_VALUE" = "$PUBLIC_PAYLOAD_HASH" ] || return 0
+  STAGED_STATE=ready
+}
+
+require_staged_image() {
+  staged_image_state
+  [ "$STAGED_STATE" = ready ] || fail "staged kernel image is $STAGED_STATE"
+}
+
+acquire_lock() {
+  [ -d "$RUN_ROOT" ] && [ ! -L "$RUN_ROOT" ] \
+    || fail 'Docker run directory is unavailable or unsafe'
+  if ! (umask 077; bb mkdir "$LOCK_DIR" 2>/dev/null); then
+    fail 'another lifecycle operation is in progress or the lifecycle lock is unsafe'
+  fi
+  if ! bb chmod 0700 "$LOCK_DIR" || ! bb chown 0:0 "$LOCK_DIR" ||
+     ! (umask 077; printf '%s\n' "$$" > "$LOCK_OWNER") ||
+     ! bb chmod 0600 "$LOCK_OWNER" || ! bb chown 0:0 "$LOCK_OWNER"; then
+    bb rm -f "$LOCK_OWNER" 2>/dev/null || true
+    bb rmdir "$LOCK_DIR" 2>/dev/null || true
+    fail 'cannot establish lifecycle lock'
+  fi
+  LOCK_OWNED=1
+  trap cleanup EXIT
+  trap 'signal_exit 129' HUP
+  trap 'signal_exit 130' INT
+  trap 'signal_exit 143' TERM
+}
+
+require_battery() {
+  [ -f "$BATTERY_CAPACITY" ] && [ ! -L "$BATTERY_CAPACITY" ] \
+    || fail 'battery capacity is unavailable'
+  BATTERY=$(bb cat "$BATTERY_CAPACITY" 2>/dev/null) \
+    || fail 'cannot read battery capacity'
+  canonical_unsigned "$BATTERY" || fail 'battery capacity is invalid'
+  [ "$BATTERY" -le 100 ] 2>/dev/null || fail 'battery capacity is invalid'
+  [ "$BATTERY" -ge 50 ] 2>/dev/null || fail 'battery must be at least 50 percent'
+}
+
+require_backup_space() {
+  # shellcheck disable=SC2016
+  AVAILABLE_KIB=$(bb df -Pk "$DOCKER_ROOT" 2>/dev/null | bb awk '
+    NR == 2 {
+      if (NF < 6 || $4 !~ /^(0|[1-9][0-9]*)$/) exit 1
+      value=$4
+    }
+    END { if (NR != 2 || value == "") exit 1; print value }
+  ') || fail 'cannot determine Docker-root free space'
+  bb awk -v available="$AVAILABLE_KIB" -v required="$PARTITION_SIZE" \
+    -v reserve="$SPACE_RESERVE_BYTES" \
+    'BEGIN { exit !((available * 1024) >= (required + reserve)) }' \
+    || fail 'insufficient free space for a boot backup and safety reserve'
+}
+
+ensure_directory() {
+  DIRECTORY=$1
+  PARENT=$2
+  LABEL=$3
+  if ! path_exists "$DIRECTORY"; then
+    (umask 077; bb mkdir "$DIRECTORY") || fail "cannot create $LABEL"
+    bb fsync "$PARENT" || fail "cannot persist $LABEL"
+  fi
+  [ -d "$DIRECTORY" ] && [ ! -L "$DIRECTORY" ] \
+    || fail "$LABEL is not a real directory"
+  if ! bb chmod 0700 "$DIRECTORY" || ! bb chown 0:0 "$DIRECTORY"; then
+    fail "cannot protect $LABEL"
+  fi
+}
+
+make_metadata() {
+  EXPECTED_METADATA=$(printf '%s\n' \
+    'KERNEL_BACKUP_VERSION=1' \
+    "build_id=$BUILD_ID" \
+    "slot_suffix=$SLOT_SUFFIX" \
+    "source_role=$BACKUP_SOURCE_ROLE" \
+    "source_payload_size=$BACKUP_SOURCE_PAYLOAD_SIZE" \
+    "source_payload_sha256=$BACKUP_SOURCE_PAYLOAD_HASH" \
+    "source_partition_size=$BACKUP_SOURCE_FULL_SIZE" \
+    "source_partition_sha256=$BACKUP_SOURCE_FULL_HASH" \
+    "target_public_payload_size=$PUBLIC_PAYLOAD_SIZE" \
+    "target_public_payload_sha256=$PUBLIC_PAYLOAD_HASH" \
+    "target_public_partition_size=$PUBLIC_FULL_SIZE" \
+    "target_public_partition_sha256=$PUBLIC_FULL_HASH")
+}
+
+validate_backup_image() {
+  [ -f "$BACKUP_IMAGE" ] && [ ! -L "$BACKUP_IMAGE" ] \
+    || fail 'boot backup is missing, linked, or not regular'
+  file_size "$BACKUP_IMAGE" || fail 'cannot measure boot backup'
+  [ "$FILE_SIZE" = "$BACKUP_SOURCE_FULL_SIZE" ] \
+    || fail 'boot backup has the wrong size'
+  direct_hash_file "$BACKUP_IMAGE" || fail 'cannot directly re-read boot backup'
+  [ "$DIRECT_HASH_VALUE" = "$BACKUP_SOURCE_FULL_HASH" ] \
+    || fail 'boot backup identity is wrong'
+}
+
+validate_backup_pair() {
+  validate_backup_image
+  [ -f "$BACKUP_METADATA" ] && [ ! -L "$BACKUP_METADATA" ] \
+    || fail 'boot backup metadata is missing, linked, or not regular'
+  make_metadata
+  METADATA_TEXT=$(bb cat "$BACKUP_METADATA" 2>/dev/null) \
+    || fail 'cannot read boot backup metadata'
+  file_size "$BACKUP_METADATA" || fail 'cannot measure boot backup metadata'
+  [ "$FILE_SIZE" -eq $((${#EXPECTED_METADATA} + 1)) ] 2>/dev/null &&
+    [ "$METADATA_TEXT" = "$EXPECTED_METADATA" ] \
+    || fail 'boot backup metadata is malformed or does not match'
+}
+
+publish_metadata() {
+  make_metadata
+  TEMP_METADATA=$BACKUP_DIR/.metadata.$$.tmp
+  path_exists "$TEMP_METADATA" && fail 'boot backup metadata temporary path already exists'
+  (umask 077; printf '%s\n' "$EXPECTED_METADATA" > "$TEMP_METADATA") \
+    || fail 'cannot write boot backup metadata'
+  if ! bb chmod 0600 "$TEMP_METADATA" || ! bb chown 0:0 "$TEMP_METADATA" ||
+     ! bb fsync "$TEMP_METADATA"; then
+    fail 'cannot persist boot backup metadata'
+  fi
+  bb ln "$TEMP_METADATA" "$BACKUP_METADATA" \
+    || fail 'cannot publish boot backup metadata without replacement'
+  bb rm -f "$TEMP_METADATA" || fail 'cannot remove metadata temporary link'
+  TEMP_METADATA=
+  bb fsync "$BACKUP_DIR" || fail 'cannot persist published boot backup metadata'
+}
+
+ensure_backup() {
+  BACKUP_SOURCE_ROLE=$BOOT_STATE
+  BACKUP_SOURCE_PAYLOAD_SIZE=$SOURCE_PAYLOAD_SIZE
+  BACKUP_SOURCE_PAYLOAD_HASH=$SOURCE_PAYLOAD_HASH
+  BACKUP_SOURCE_FULL_SIZE=$SOURCE_FULL_SIZE
+  BACKUP_SOURCE_FULL_HASH=$SOURCE_FULL_HASH
+  BACKUP_DIR=$BACKUP_ROOT/$BUILD_ID
+  BACKUP_IMAGE=$BACKUP_DIR/$SOURCE_FULL_HASH$SLOT_SUFFIX.img
+  BACKUP_METADATA=$BACKUP_IMAGE.meta
+  ensure_directory "$BACKUP_ROOT" "$DOCKER_ROOT" 'boot backup root'
+  ensure_directory "$BACKUP_DIR" "$BACKUP_ROOT" 'build-qualified boot backup directory'
+  if path_exists "$BACKUP_IMAGE"; then
+    if ! path_exists "$BACKUP_METADATA"; then
+      # Publishing the immutable image and its metadata is intentionally a
+      # two-file transaction. A power loss after the image directory fsync is
+      # recoverable only after the image is re-proved against the live,
+      # build-qualified source identity.
+      validate_backup_image
+      publish_metadata
+    fi
+    validate_backup_pair
+    return 0
+  fi
+  path_exists "$BACKUP_METADATA" \
+    && fail 'boot backup metadata exists without its immutable image'
+  TEMP_BACKUP=$BACKUP_DIR/.backup.$$.tmp
+  path_exists "$TEMP_BACKUP" && fail 'boot backup temporary path already exists'
+  bb dd if="$BOOT_DEVICE" of="$TEMP_BACKUP" bs=1048576 conv=fsync 2>/dev/null \
+    || fail 'cannot copy the active boot partition to backup'
+  [ -f "$TEMP_BACKUP" ] && [ ! -L "$TEMP_BACKUP" ] \
+    || fail 'boot backup temporary output is unsafe'
+  file_size "$TEMP_BACKUP" || fail 'cannot measure boot backup temporary output'
+  [ "$FILE_SIZE" = "$SOURCE_FULL_SIZE" ] || fail 'boot backup copy is truncated'
+  direct_hash_file "$TEMP_BACKUP" || fail 'cannot directly re-read boot backup copy'
+  [ "$DIRECT_HASH_VALUE" = "$SOURCE_FULL_HASH" ] \
+    || fail 'boot backup copy does not match the active partition'
+  if ! bb chmod 0600 "$TEMP_BACKUP" || ! bb chown 0:0 "$TEMP_BACKUP" ||
+     ! bb fsync "$TEMP_BACKUP"; then
+    fail 'cannot persist boot backup copy'
+  fi
+  bb ln "$TEMP_BACKUP" "$BACKUP_IMAGE" \
+    || fail 'cannot publish boot backup without replacement'
+  bb rm -f "$TEMP_BACKUP" || fail 'cannot remove boot backup temporary link'
+  TEMP_BACKUP=
+  bb fsync "$BACKUP_DIR" || fail 'cannot persist published boot backup'
+  publish_metadata
+  validate_backup_pair
+}
+
+find_restore_backup() {
+  # shellcheck disable=SC2016
+  RESTORE_ROWS=$(bb awk -F "$TAB" -v tab="$TAB" -v build="$BUILD_ID" '
+    $1 == "BOOT_STATE" && $2 == build && $3 != "current-public" {
+      print $3 tab $4 tab $5 tab $6 tab $7
+    }
+  ' "$INPUTS") || fail 'cannot select authorized restore identities'
+  hash_inputs || fail 'cannot rehash installer inputs during restore selection'
+  [ "$INPUT_HASH" = "$ACTION_INPUT_HASH" ] \
+    || fail 'installer inputs changed during restore selection'
+  RESTORE_COUNT=0
+  while IFS="$TAB" read -r RESTORE_ROLE RESTORE_PAYLOAD_SIZE RESTORE_PAYLOAD_HASH \
+      RESTORE_FULL_SIZE RESTORE_FULL_HASH; do
+    [ -n "$RESTORE_ROLE" ] || continue
+    RESTORE_DIR=$BACKUP_ROOT/$BUILD_ID
+    RESTORE_IMAGE=$RESTORE_DIR/$RESTORE_FULL_HASH$SLOT_SUFFIX.img
+    RESTORE_METADATA=$RESTORE_IMAGE.meta
+    if path_exists "$RESTORE_IMAGE" || path_exists "$RESTORE_METADATA"; then
+      BACKUP_SOURCE_ROLE=$RESTORE_ROLE
+      BACKUP_SOURCE_PAYLOAD_SIZE=$RESTORE_PAYLOAD_SIZE
+      BACKUP_SOURCE_PAYLOAD_HASH=$RESTORE_PAYLOAD_HASH
+      BACKUP_SOURCE_FULL_SIZE=$RESTORE_FULL_SIZE
+      BACKUP_SOURCE_FULL_HASH=$RESTORE_FULL_HASH
+      BACKUP_DIR=$RESTORE_DIR
+      BACKUP_IMAGE=$RESTORE_IMAGE
+      BACKUP_METADATA=$RESTORE_METADATA
+      validate_backup_pair
+      RESTORE_COUNT=$((RESTORE_COUNT + 1))
+      SELECTED_RESTORE_IMAGE=$RESTORE_IMAGE
+      SELECTED_RESTORE_ROLE=$RESTORE_ROLE
+      SELECTED_RESTORE_PAYLOAD_SIZE=$RESTORE_PAYLOAD_SIZE
+      SELECTED_RESTORE_PAYLOAD_HASH=$RESTORE_PAYLOAD_HASH
+      SELECTED_RESTORE_FULL_HASH=$RESTORE_FULL_HASH
+    fi
+  done <<EOF
+$RESTORE_ROWS
+EOF
+  [ "$RESTORE_COUNT" -eq 1 ] \
+    || fail 'restore requires exactly one complete authorized active-slot backup'
+}
+
+verify_restored_partition() {
+  direct_hash_file "$BOOT_DEVICE" || recovery_required
+  [ "$DIRECT_HASH_VALUE" = "$SELECTED_RESTORE_FULL_HASH" ] || recovery_required
+  RESTORED_PAYLOAD=$($SWAP_BOOT_KERNEL --print-kernel-sha256 "$BOOT_DEVICE" 2>/dev/null) \
+    || recovery_required
+  OLD_IFS=$IFS
+  IFS=' '
+  # shellcheck disable=SC2086
+  set -- $RESTORED_PAYLOAD
+  IFS=$OLD_IFS
+  [ "$#" -eq 2 ] && [ "$1" = "$SELECTED_RESTORE_PAYLOAD_SIZE" ] &&
+    [ "$2" = "$SELECTED_RESTORE_PAYLOAD_HASH" ] || recovery_required
+}
+
+[ -x "$BUSYBOX" ] || fail 'KernelSU BusyBox is unavailable'
+[ "$(bb id -u 2>/dev/null || true)" = 0 ] || fail 'root is required' 2
+[ -f "$PREFLIGHT" ] && [ ! -L "$PREFLIGHT" ] && [ -x "$PREFLIGHT" ] \
+  || fail 'installer preflight helper is unavailable or unsafe'
+[ -f "$SWAP_BOOT_KERNEL" ] && [ ! -L "$SWAP_BOOT_KERNEL" ] && [ -x "$SWAP_BOOT_KERNEL" ] \
+  || fail 'boot swap helper is unavailable or unsafe'
+
+case "${1:-}" in
+  status) [ "$#" -eq 1 ] || usage ;;
+  install|restore) [ "$#" -eq 2 ] || usage ;;
+  *) usage ;;
+esac
+COMMAND=$1
+CONFIRMATION=${2:-}
+classify_active_boot
+INITIAL_BUILD_ID=$BUILD_ID
+INITIAL_SLOT_SUFFIX=$SLOT_SUFFIX
+INITIAL_INPUT_HASH=$CLASSIFY_INPUT_HASH
+
+if [ "$COMMAND" = status ]; then
+  staged_image_state
+  printf '%s\n' \
+    'KERNELCTL_VERSION=1' \
+    "build_id=$BUILD_ID" \
+    "slot_suffix=$SLOT_SUFFIX" \
+    "boot_state=$BOOT_STATE" \
+    "staged_image=$STAGED_STATE"
+  exit 0
+fi
+
+case "$COMMAND:$CONFIRMATION" in
+  "install:INSTALL:$BUILD_ID:$SLOT_SUFFIX"|"restore:RESTORE:$BUILD_ID:$SLOT_SUFFIX") ;;
+  *) fail "confirmation must bind $COMMAND, build $BUILD_ID, and active suffix $SLOT_SUFFIX" 2 ;;
+esac
+
+acquire_lock
+classify_active_boot
+[ "$BUILD_ID" = "$INITIAL_BUILD_ID" ] && [ "$SLOT_SUFFIX" = "$INITIAL_SLOT_SUFFIX" ] &&
+  [ "$CLASSIFY_INPUT_HASH" = "$INITIAL_INPUT_HASH" ] \
+  || fail 'kernel context changed before the lifecycle lock was established'
+ACTION_INPUT_HASH=$CLASSIFY_INPUT_HASH
+
+if [ "$COMMAND" = install ]; then
+  require_staged_image
+  if [ "$BOOT_STATE" = current-public ]; then
+    printf '%s\n' "kernel already installed for $BUILD_ID on $SLOT_SUFFIX"
+    exit 0
+  fi
+  require_battery
+  require_backup_space
+  ensure_backup
+  require_staged_image
+  hash_inputs || fail 'cannot rehash installer inputs before boot swap'
+  [ "$INPUT_HASH" = "$ACTION_INPUT_HASH" ] \
+    || fail 'installer inputs changed before boot swap'
+  PARTITION_WRITE_POSSIBLE=1
+  if "$SWAP_BOOT_KERNEL" "$BOOT_DEVICE" "$STAGED_IMAGE" \
+      --expect-target-size "$PARTITION_SIZE" \
+      --expect-current-sha256 "$SOURCE_FULL_HASH" \
+      --expect-current-kernel-sha256 "$SOURCE_PAYLOAD_HASH" \
+      --expect-image-sha256 "$PUBLIC_PAYLOAD_HASH" \
+      --expect-output-sha256 "$PUBLIC_FULL_HASH"; then
+    :
+  else
+    SWAP_STATUS=$?
+    case "$SWAP_STATUS" in
+      1|2)
+        PARTITION_WRITE_POSSIBLE=0
+        fail "boot swap refused before a reported write (status $SWAP_STATUS)"
+        ;;
+      *) recovery_required ;;
+    esac
+  fi
+  classify_active_boot || recovery_required
+  [ "$BUILD_ID" = "$INITIAL_BUILD_ID" ] && [ "$SLOT_SUFFIX" = "$INITIAL_SLOT_SUFFIX" ] &&
+    [ "$BOOT_STATE" = current-public ] || recovery_required
+  printf '%s\n' "kernel installed for $BUILD_ID on $SLOT_SUFFIX; reboot is operator-controlled"
+  exit 0
+fi
+
+[ "$BOOT_STATE" = current-public ] \
+  || fail 'restore is authorized only from the exact current-public boot state'
+find_restore_backup
+# Backup verification can be a long read. Re-run the complete generated-input,
+# device, KSU, slot, full-partition, and payload gate after it, immediately
+# before declaring that a partition write may begin.
+classify_active_boot
+[ "$BUILD_ID" = "$INITIAL_BUILD_ID" ] && [ "$SLOT_SUFFIX" = "$INITIAL_SLOT_SUFFIX" ] &&
+  [ "$BOOT_STATE" = current-public ] && [ "$CLASSIFY_INPUT_HASH" = "$ACTION_INPUT_HASH" ] \
+  || fail 'kernel context changed during restore preparation'
+PARTITION_WRITE_POSSIBLE=1
+bb dd if="$SELECTED_RESTORE_IMAGE" of="$BOOT_DEVICE" bs=1048576 conv=fsync 2>/dev/null \
+  || recovery_required
+verify_restored_partition
+if ! classify_active_boot; then
+  recovery_required
+fi
+[ "$BUILD_ID" = "$INITIAL_BUILD_ID" ] && [ "$SLOT_SUFFIX" = "$INITIAL_SLOT_SUFFIX" ] &&
+  [ "$BOOT_STATE" = "$SELECTED_RESTORE_ROLE" ] || recovery_required
+printf '%s\n' "kernel restored to $SELECTED_RESTORE_ROLE for $BUILD_ID on $SLOT_SUFFIX; reboot is operator-controlled"
+exit 0

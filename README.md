@@ -1,24 +1,44 @@
 # EIP Pixel 8a Forge
 
-Fresh Pixel 8a port of the working Pixel 11 Forge architecture.
+Pixel 8a port of the working Pixel 11 Forge architecture. Forge itself remains
+in the standalone `eip-cve-public-v4` repository.
 
-The initial target is deliberately narrow:
+The supported target is deliberately exact:
 
-- device: Pixel 8a (`akita`)
-- Android: 17
-- build: `CP2A.260805.005`
-- kernel: Google common 6.1 commit `bd23337e42e794964a89f47596daf1209a25ee1a`
-- Forge source: pinned from the standalone `eip-cve-public-v4` repository
+- Pixel 8a (`akita`)
+- Android 17 build `CP2A.260805.005`
+- security patch `2026-08-05`
+- Google common 6.1 kernel commit
+  `bd23337e42e794964a89f47596daf1209a25ee1a`
+- KernelSU-Next 3.3.0 in LKM mode
+- Docker Engine 29.8.0 over Wi-Fi
 
-The first slice builds the Docker-capable kernel and the minimal KernelSU host
-module. It starts from the exact stock phone config, applies a small reviewed
-fragment, and packages a prepared Android-patched Docker engine without
-committing generated binaries or Google firmware.
+`DEVICE.json` records the source, firmware, kernel, boot, KernelSU, and Docker
+identities qualified on the phone. Google firmware, generated boot images,
+Docker data, credentials, and compiled artifacts are intentionally not in Git.
+
+## Current state
+
+The Docker-capable kernel and managed KernelSU host module are phone-qualified.
+The module keeps Docker parked by default and provides one lifecycle command:
+
+```sh
+/data/docker/bin/hostctl status
+/data/docker/bin/hostctl disk-init --size-bytes 8589934592
+/data/docker/bin/hostctl start
+/data/docker/bin/hostctl stop
+/data/docker/bin/hostctl autostart on
+/data/docker/bin/hostctl autostart off
+```
+
+On the target phone it mounts a labeled sparse ext4 image at
+`/data/docker/lib`, runs Docker with `overlay2`, discovers Android's current
+numeric `wlan0` table, and installs the two bridge policy routes. A fresh
+Alpine container has passed DNS and HTTPS egress over Wi-Fi.
 
 ## Kernel build
 
-The exact Google source archive is recorded in `DEVICE.json` and is intentionally
-not committed. Download it, then run:
+Download the exact Google source archive recorded in `DEVICE.json`, then run:
 
 ```sh
 kernel/build.sh \
@@ -26,38 +46,33 @@ kernel/build.sh \
   --out kernel/out/CP2A.260805.005
 ```
 
-The build runs in a Linux Docker volume because the Android kernel source has
+The build uses a Linux Docker volume because the Android kernel source has
 case-distinct filenames that cannot safely share a default macOS filesystem.
 
-## Docker host module
+## Module build
 
-Build the Android-native namespace helper into a prepared engine directory,
-then package the KernelSU module:
+The module build uses the pinned Bootlin AArch64-musl toolchain in
+`tools/aarch64-musl-toolchain.json`:
 
 ```sh
-ANDROID_NDK_HOME=/path/to/android-ndk \
-  tools/build-privns.sh /path/to/engine/privns
+tools/build-module-tools.sh \
+  --toolchain-archive /path/to/aarch64--musl--stable-2025.08-1.tar.xz \
+  --out /tmp/eip-pixel8a-module-tools
 
-tools/build-host-module.sh \
-  --engine-dir /path/to/engine \
-  --out artifacts/eip-pixel8a-docker-host.zip
+python3 tools/assemble-module.py --installable \
+  --patch-engine /tmp/eip-pixel8a-module-tools/patch-engine \
+  --swap-boot-kernel /tmp/eip-pixel8a-module-tools/swap-boot-kernel \
+  --privns /tmp/eip-pixel8a-module-tools/privns \
+  --route-policy /tmp/eip-pixel8a-module-tools/route-policy \
+  --toolchain-provenance tools/aarch64-musl-toolchain.json \
+  --musl-license tools/licenses/musl-COPYRIGHT \
+  --output /tmp/eip-pixel8a-forge-module.zip
 ```
 
-The module creates and mounts an 8 GiB sparse ext4 data image, enables the
-two Wi-Fi policy routes required for bridge traffic, and leaves Docker parked
-by default. Setting `AUTOSTART=1` in `/data/docker/config/host.conf` starts the
-daemon during the next boot.
+The installer downloads the exact Docker archive recorded in
+`tools/engine.json`; it does not bundle Docker binaries.
 
-## Qualified live result
+## Development checks
 
-On build `CP2A.260805.005`, the recorded kernel and KernelSU images survive a
-reboot with root and Wi-Fi working. Docker 29.8.0 uses `overlay2`, pulls ARM64
-images, resolves DNS, and reaches HTTPS from an Alpine container over Wi-Fi.
-Exact source and qualified artifact hashes are in `DEVICE.json`.
-
-## Pull-request checks
-
-`tools/check.sh` runs the fast repository checks locally and in GitHub Actions.
-Claude review is configured for every pull-request update after the repository
-secret `CLAUDE_CODE_OAUTH_TOKEN` is added and the repository variable
-`CLAUDE_REVIEW_ENABLED` is set to `true`.
+Run `tools/check.sh`. Pull requests also run the same check and a focused
+Claude review. The remaining delivery slices are recorded in `PLAN.md`.

@@ -1,0 +1,373 @@
+#!/system/bin/sh
+# Prepare one exact Docker Engine release entirely in KernelSU's temporary
+# directory. This helper never activates a release or changes /data/docker.
+set -u
+set -f
+
+PROGRAM=prepare-engine
+BUSYBOX=/data/adb/ksu/bin/busybox
+SYSTEM_BIN=/system/bin
+CACHE_ROOT=/data/docker/downloads
+SIDELOAD_ROOT=/data/local/tmp
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/*}
+INPUTS=$MODDIR/installer-inputs.tsv
+RELEASE_MANIFEST=$MODDIR/release-manifest.tsv
+PATCH_ENGINE=$MODDIR/bin/patch-engine
+CURL=$SYSTEM_BIN/curl
+WORK=
+WORK_OWNED=0
+PREPARED=
+
+fail() {
+  printf '%s: %s\n' "$PROGRAM" "$1" >&2
+  exit "${2:-1}"
+}
+
+bb() {
+  "$BUSYBOX" "$@"
+}
+
+path_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+valid_sha256() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+canonical_unsigned() {
+  case "$1" in 0|[1-9]*) ;; *) return 1 ;; esac
+  case "$1" in *[!0-9]*) return 1 ;; esac
+}
+
+# Called through EXIT and signal traps.
+# shellcheck disable=SC2329
+cleanup() {
+  [ "$WORK_OWNED" = 1 ] || return 0
+  case "$WORK" in "$TMPDIR/.eip-engine-prepare.work") ;; *) return 0 ;; esac
+  bb rm -rf "$WORK" 2>/dev/null || true
+  WORK_OWNED=0
+}
+
+# Called through signal traps.
+# shellcheck disable=SC2329
+cleanup_signal() {
+  SIGNAL_STATUS=$1
+  trap - EXIT HUP INT TERM
+  cleanup
+  exit "$SIGNAL_STATUS"
+}
+
+file_identity() {
+  IDENTITY_FILE=$1
+  IDENTITY_SIZE=$(bb stat -c '%s' "$IDENTITY_FILE" 2>/dev/null) || return 1
+  canonical_unsigned "$IDENTITY_SIZE" || return 1
+  IDENTITY_LINE=$(bb sha256sum "$IDENTITY_FILE" 2>/dev/null) || return 1
+  IDENTITY_OLD_IFS=$IFS
+  IFS=' '
+  # Intentional splitting parses the fixed two-field sha256sum record.
+  # shellcheck disable=SC2086
+  set -- $IDENTITY_LINE
+  IFS=$IDENTITY_OLD_IFS
+  [ "$#" -eq 2 ] && [ "$2" = "$IDENTITY_FILE" ] && valid_sha256 "$1" || return 1
+  IDENTITY_HASH=$1
+}
+
+require_identity() {
+  REQUIRE_FILE=$1
+  REQUIRE_SIZE=$2
+  REQUIRE_HASH=$3
+  [ -f "$REQUIRE_FILE" ] && [ ! -L "$REQUIRE_FILE" ] || return 1
+  file_identity "$REQUIRE_FILE" || return 1
+  [ "$IDENTITY_SIZE" = "$REQUIRE_SIZE" ] && [ "$IDENTITY_HASH" = "$REQUIRE_HASH" ]
+}
+
+hash_regular() {
+  HASH_FILE=$1
+  [ -f "$HASH_FILE" ] && [ ! -L "$HASH_FILE" ] || return 1
+  file_identity "$HASH_FILE"
+}
+
+verify_inputs_unchanged() {
+  hash_regular "$INPUTS" || fail 'cannot hash installer inputs'
+  [ "$IDENTITY_HASH" = "$PINNED_INPUTS_HASH" ] \
+    || fail 'installer inputs changed during engine preparation'
+}
+
+verify_manifest_unchanged() {
+  hash_regular "$RELEASE_MANIFEST" || fail 'cannot hash release manifest'
+  [ "$IDENTITY_HASH" = "$PINNED_MANIFEST_HASH" ] \
+    || fail 'release manifest changed during engine preparation'
+}
+
+[ "$#" -eq 0 ] || fail 'this internal helper accepts no arguments' 2
+[ -x "$BUSYBOX" ] || fail 'KernelSU BusyBox is unavailable'
+[ "$(bb id -u 2>/dev/null || true)" = 0 ] || fail 'root is required' 2
+case "${TMPDIR:-}" in
+  /*) ;;
+  *) fail 'TMPDIR must be an absolute directory' 2 ;;
+esac
+case "$TMPDIR" in
+  /|*/../*|*/..|*/./*|*/.) fail 'TMPDIR has an unsafe form' 2 ;;
+  *[!A-Za-z0-9_./+-]*) fail 'TMPDIR has an unsafe form' 2 ;;
+esac
+[ -d "$TMPDIR" ] && [ ! -L "$TMPDIR" ] || fail 'TMPDIR must be a real directory'
+RESOLVED_TMP=$(bb readlink -f "$TMPDIR" 2>/dev/null) || fail 'cannot resolve TMPDIR'
+[ "$RESOLVED_TMP" = "$TMPDIR" ] || fail 'TMPDIR must be a canonical real directory'
+
+for REQUIRED in "$INPUTS" "$RELEASE_MANIFEST" "$PATCH_ENGINE"; do
+  [ -f "$REQUIRED" ] && [ ! -L "$REQUIRED" ] || fail "missing regular package input: $REQUIRED"
+done
+[ -x "$PATCH_ENGINE" ] || fail 'engine patch helper is not executable'
+
+export LC_ALL=C
+umask 077
+WORK=$TMPDIR/.eip-engine-prepare.work
+PREPARED=$TMPDIR/eip-engine-prepared
+path_exists "$WORK" && fail 'engine preparation work path already exists'
+path_exists "$PREPARED" && fail 'prepared engine output already exists'
+bb mkdir "$WORK" || fail 'cannot create engine preparation work directory'
+WORK_OWNED=1
+trap cleanup EXIT
+trap 'cleanup_signal 129' HUP
+trap 'cleanup_signal 130' INT
+trap 'cleanup_signal 143' TERM
+bb chmod 0700 "$WORK" || fail 'cannot protect engine preparation work directory'
+bb chown 0:0 "$WORK" || fail 'cannot own engine preparation work directory'
+
+hash_regular "$INPUTS" || fail 'cannot hash installer inputs'
+PINNED_INPUTS_HASH=$IDENTITY_HASH
+hash_regular "$RELEASE_MANIFEST" || fail 'cannot hash release manifest'
+PINNED_MANIFEST_HASH=$IDENTITY_HASH
+
+TAB=$(printf '\t')
+ENGINE_PLAN=$WORK/engine-plan.tsv
+# The single-quoted program is awk source, not shell interpolation.
+# shellcheck disable=SC2016
+bb awk -F "$TAB" '
+  function reject() { bad = 1; exit 1 }
+  function uint(value) { return value ~ /^(0|[1-9][0-9]*)$/ }
+  function positive(value) { return uint(value) && value != "0" }
+  function hash(value) { return length(value) == 64 && value !~ /[^0-9a-f]/ }
+  function semver(value) {
+    return value ~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
+  }
+  function clean(position) {
+    for (position = 1; position <= NF; position++) if ($position !~ /^[ -~]+$/) return 0
+    return 1
+  }
+  NR == 1 { if (NF != 1 || $1 != "INSTALLER_INPUTS_VERSION=1") reject(); next }
+  NR == 2 { if (!clean() || NF != 3 || $1 != "MODULE" || !positive($3)) reject(); next }
+  NR == 3 {
+    if (!clean() || NF != 6 || $1 != "ENGINE" || !semver($2) ||
+        $3 != "docker-" $2 ".tgz" || !positive($4) || !hash($5) ||
+        $6 != "https://download.docker.com/linux/static/stable/aarch64/" $3) reject()
+    print
+    next
+  }
+  NR >= 4 && NR <= 6 {
+    if (!clean() || NF != 4 || $1 != "RULE" || $2 != sprintf("%d", NR - 4) ||
+        substr($3, 1, 1) != "/" || substr($4, 1, 1) != "/" ||
+        length($3) != length($4)) reject()
+    print
+    next
+  }
+  NR >= 7 && NR <= 14 {
+    split("containerd containerd-shim-runc-v2 ctr docker docker-init docker-proxy dockerd runc", names, " ")
+    if (!clean() || NF != 9 || $1 != "BINARY" || $2 != names[NR - 6] ||
+        !positive($3) || !hash($4) || !hash($5) || $6 !~ /^[01]$/ ||
+        !uint($7) || !uint($8) || !uint($9)) reject()
+    if (($6 == "0" && ($7 != "0" || $8 != "0" || $9 != "0")) ||
+        ($6 == "1" && ($7 + $8 + $9 == 0))) reject()
+    print
+    next
+  }
+  NR == 15 { if (!clean() || $1 != "BUILD") reject(); complete = 1; exit }
+  END { if (bad || !complete) exit 1 }
+' "$INPUTS" > "$ENGINE_PLAN" || fail 'installer engine inputs are malformed'
+[ -f "$ENGINE_PLAN" ] && [ ! -L "$ENGINE_PLAN" ] || fail 'cannot create engine plan'
+verify_inputs_unchanged
+
+# shellcheck disable=SC2016
+ENGINE_LINE=$(bb awk -F "$TAB" '$1 == "ENGINE" { print; found++ } END { if (found != 1) exit 1 }' "$ENGINE_PLAN") \
+  || fail 'cannot select engine record'
+OLD_IFS=$IFS
+IFS=$TAB
+# Intentional splitting parses the fixed tab-separated engine record.
+# shellcheck disable=SC2086
+set -- $ENGINE_LINE
+IFS=$OLD_IFS
+[ "$#" -eq 6 ] || fail 'engine record has an invalid shape'
+ENGINE_VERSION=$2
+TARBALL_NAME=$3
+TARBALL_SIZE=$4
+TARBALL_HASH=$5
+TARBALL_URL=$6
+
+for RULE_INDEX in 0 1 2; do
+  # shellcheck disable=SC2016
+  RULE_LINE=$(bb awk -F "$TAB" -v wanted="$RULE_INDEX" \
+    '$1 == "RULE" && $2 == wanted { print $3 "\t" $4; found++ } END { if (found != 1) exit 1 }' \
+    "$ENGINE_PLAN") || fail 'cannot select engine replacement rule'
+  IFS=$TAB
+  # Intentional splitting parses the fixed two-field rule record.
+  # shellcheck disable=SC2086
+  set -- $RULE_LINE
+  IFS=$OLD_IFS
+  [ "$#" -eq 2 ] || fail 'engine replacement rule has an invalid shape'
+  case "$RULE_INDEX" in
+    0) RULE0_FROM=$1; RULE0_TO=$2 ;;
+    1) RULE1_FROM=$1; RULE1_TO=$2 ;;
+    2) RULE2_FROM=$1; RULE2_TO=$2 ;;
+  esac
+done
+
+CACHE_FILE=$CACHE_ROOT/$TARBALL_NAME
+SIDELOAD_FILE=$SIDELOAD_ROOT/$TARBALL_NAME
+ARCHIVE=$WORK/$TARBALL_NAME
+ACQUISITION_SOURCE=
+if path_exists "$CACHE_FILE"; then
+  require_identity "$CACHE_FILE" "$TARBALL_SIZE" "$TARBALL_HASH" \
+    || fail 'existing-host engine cache has an unsafe type or wrong identity'
+  bb cp "$CACHE_FILE" "$ARCHIVE" || fail 'cannot copy verified engine cache'
+  ACQUISITION_SOURCE=cache
+elif path_exists "$SIDELOAD_FILE"; then
+  require_identity "$SIDELOAD_FILE" "$TARBALL_SIZE" "$TARBALL_HASH" \
+    || fail 'sideloaded engine archive has an unsafe type or wrong identity'
+  bb cp "$SIDELOAD_FILE" "$ARCHIVE" || fail 'cannot copy verified sideloaded engine archive'
+  ACQUISITION_SOURCE=sideload
+elif [ -f "$CURL" ] && [ ! -L "$CURL" ] && [ -x "$CURL" ]; then
+  "$CURL" --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --output "$ARCHIVE" "$TARBALL_URL" \
+    || fail 'verified HTTPS engine download failed'
+  ACQUISITION_SOURCE=download
+else
+  fail "no qualified downloader; sideload with: adb push $TARBALL_NAME $SIDELOAD_FILE"
+fi
+require_identity "$ARCHIVE" "$TARBALL_SIZE" "$TARBALL_HASH" \
+  || fail 'private engine archive copy has the wrong identity'
+
+INVENTORY=$WORK/archive-inventory.txt
+bb tar -tzf "$ARCHIVE" > "$INVENTORY" \
+  || fail 'cannot list verified engine archive'
+# shellcheck disable=SC2016
+bb awk '
+  BEGIN {
+    allowed["docker/"] = 1
+    split("containerd containerd-shim-runc-v2 ctr docker docker-init docker-proxy dockerd runc", names, " ")
+    for (position = 1; position <= 8; position++) allowed["docker/" names[position]] = 1
+  }
+  {
+    if ($0 !~ /^[ -~]+$/ || !($0 in allowed) || seen[$0]++) exit 1
+    count++
+  }
+  END { if (count != 9) exit 1 }
+' "$INVENTORY" || fail 'engine archive inventory is not the exact pinned shape'
+
+STAGING=$WORK/release
+bb mkdir "$STAGING" || fail 'cannot create engine release staging directory'
+bb chmod 0700 "$STAGING" || fail 'cannot protect engine release staging directory'
+bb chown 0:0 "$STAGING" || fail 'cannot own engine release staging directory'
+
+while IFS="$TAB" read -r RECORD_TYPE NAME SIZE INPUT_HASH OUTPUT_HASH PATCH COUNT0 COUNT1 COUNT2 EXTRA
+do
+  [ "$RECORD_TYPE" = BINARY ] || continue
+  [ -z "${EXTRA:-}" ] || fail "engine binary record has extra fields: $NAME"
+  INPUT_FILE=$WORK/input.$NAME
+  OUTPUT_FILE=$STAGING/$NAME
+  path_exists "$INPUT_FILE" && fail "engine input path already exists: $NAME"
+  path_exists "$OUTPUT_FILE" && fail "engine output path already exists: $NAME"
+  bb tar -xzOf "$ARCHIVE" "docker/$NAME" > "$INPUT_FILE" \
+    || fail "cannot stream engine archive member: $NAME"
+  require_identity "$INPUT_FILE" "$SIZE" "$INPUT_HASH" \
+    || fail "engine archive member has the wrong identity: $NAME"
+  if [ "$PATCH" = 1 ]; then
+    "$PATCH_ENGINE" "$INPUT_FILE" "$OUTPUT_FILE" \
+      --expect-input-size "$SIZE" \
+      --expect-input-sha256 "$INPUT_HASH" \
+      --expect-output-sha256 "$OUTPUT_HASH" \
+      --replace "$RULE0_FROM" "$RULE0_TO" "$COUNT0" \
+      --replace "$RULE1_FROM" "$RULE1_TO" "$COUNT1" \
+      --replace "$RULE2_FROM" "$RULE2_TO" "$COUNT2" \
+      >/dev/null \
+      || fail "engine patch failed: $NAME"
+  else
+    "$PATCH_ENGINE" "$INPUT_FILE" "$OUTPUT_FILE" \
+      --expect-input-size "$SIZE" \
+      --expect-input-sha256 "$INPUT_HASH" \
+      --expect-output-sha256 "$OUTPUT_HASH" \
+      >/dev/null \
+      || fail "engine copy verification failed: $NAME"
+  fi
+  require_identity "$OUTPUT_FILE" "$SIZE" "$OUTPUT_HASH" \
+    || fail "prepared engine binary has the wrong identity: $NAME"
+  bb chmod 0755 "$OUTPUT_FILE" || fail "cannot set engine binary mode: $NAME"
+  bb chown 0:0 "$OUTPUT_FILE" || fail "cannot own engine binary: $NAME"
+  bb rm -f "$INPUT_FILE" || fail "cannot remove transient engine input: $NAME"
+done < "$ENGINE_PLAN"
+
+RELEASE_PLAN=$WORK/release-plan.tsv
+# shellcheck disable=SC2016
+bb awk -F "$TAB" '
+  function reject() { bad = 1; exit 1 }
+  function positive(value) { return value ~ /^[1-9][0-9]*$/ }
+  function hash(value) { return length(value) == 64 && value !~ /[^0-9a-f]/ }
+  function clean(position) {
+    for (position = 1; position <= NF; position++) if ($position !~ /^[ -~]+$/) return 0
+    return 1
+  }
+  NR == 1 { if (NF != 1 || $1 != "RELEASE_MANIFEST_VERSION=1") reject(); next }
+  {
+    split("buildkit-runc.sh containerd containerd-shim-runc-v2 ctr docker docker-init docker-proxy dockerd dockerd.sh hostctl privns route-policy runc", names, " ")
+    if (!clean() || NF != 4 || NR > 14 || $1 != names[NR - 1] ||
+        !positive($2) || !hash($3) || $4 != "0755") reject()
+    print
+    count++
+  }
+  END { if (bad || count != 13) exit 1 }
+' "$RELEASE_MANIFEST" > "$RELEASE_PLAN" || fail 'release manifest is malformed'
+verify_manifest_unchanged
+
+while IFS="$TAB" read -r NAME SIZE HASH MODE EXTRA
+do
+  [ -n "$NAME" ] && [ -z "${EXTRA:-}" ] || fail 'release plan has an invalid row'
+  [ "$MODE" = 0755 ] || fail "release plan has an invalid mode: $NAME"
+  TARGET=$STAGING/$NAME
+  if ! path_exists "$TARGET"; then
+    case "$NAME" in
+      buildkit-runc.sh|dockerd.sh|hostctl|privns|route-policy)
+        SOURCE=$MODDIR/bin/$NAME
+        require_identity "$SOURCE" "$SIZE" "$HASH" \
+          || fail "packaged runtime member has the wrong identity: $NAME"
+        bb cp "$SOURCE" "$TARGET" || fail "cannot copy packaged runtime member: $NAME"
+        bb chmod 0755 "$TARGET" || fail "cannot set packaged runtime mode: $NAME"
+        bb chown 0:0 "$TARGET" || fail "cannot own packaged runtime member: $NAME"
+        ;;
+      *) fail "prepared engine member is missing: $NAME" ;;
+    esac
+  fi
+  require_identity "$TARGET" "$SIZE" "$HASH" \
+    || fail "prepared release member has the wrong identity: $NAME"
+  [ "$(bb stat -c '%a' "$TARGET" 2>/dev/null || true)" = 755 ] \
+    || fail "prepared release member has the wrong mode: $NAME"
+done < "$RELEASE_PLAN"
+
+TREE_MEMBERS=$(bb ls -A "$STAGING" 2>/dev/null) || fail 'cannot inspect prepared release tree'
+TREE_COUNT=$(printf '%s\n' "$TREE_MEMBERS" | bb awk 'NF { count++ } END { print count + 0 }') \
+  || fail 'cannot count prepared release members'
+[ "$TREE_COUNT" = 13 ] || fail 'prepared release tree has unexpected content'
+verify_inputs_unchanged
+verify_manifest_unchanged
+
+bb mv -T "$STAGING" "$PREPARED" || fail 'cannot publish prepared engine tree'
+printf '%s\n' \
+  'ENGINE_PREPARE_VERSION=1' \
+  "engine_version=$ENGINE_VERSION" \
+  "acquisition_source=$ACQUISITION_SOURCE" \
+  "prepared_path=$PREPARED" \
+  "manifest_path=$RELEASE_MANIFEST" \
+  "installer_inputs_sha256=$PINNED_INPUTS_HASH" \
+  "release_manifest_sha256=$PINNED_MANIFEST_HASH"
+exit 0
