@@ -64,7 +64,8 @@ DISK_MAX_BYTES=1099511627776
 DISK_FREE_MARGIN_BYTES=1073741824
 DEFAULT_BRIDGE_POOL_CIDR=172.17.0.0/16
 EXPECTED_ROOT_OWNER=0:0
-EXPECTED_EXT4_FEATURES='^has_journal,^casefold'
+EXPECTED_EXT4_FEATURES='^casefold'
+COMPAT_EXT4_FEATURES='^has_journal,^casefold'
 EXPECTED_MOUNT_OPTIONS=noatime,nodev
 DOCKER_HOST=unix://$DOCKER_SOCKET
 export DOCKER_HOST
@@ -427,12 +428,21 @@ probe_daemon() {
   fi
 }
 
-remove_stale_pidfile() {
+remove_inactive_pidfile() {
   probe_daemon
-  [ "$DAEMON_STATE" = stale-pidfile ] || die 'Docker pidfile is not proved stale'
+  INACTIVE_PID_STATE=$DAEMON_STATE
+  case "$INACTIVE_PID_STATE" in
+    stale-pidfile|foreign-pid) ;;
+    *) die 'Docker pidfile is not proved inactive' ;;
+  esac
   STALE_PID=$DAEMON_PID
-  read_pidfile && [ "$READ_PID" = "$STALE_PID" ] || die 'Docker pidfile changed during stale recovery'
-  [ ! -d "$PROC_ROOT/$STALE_PID" ] || die 'Docker pid was reused during stale recovery'
+  read_pidfile && [ "$READ_PID" = "$STALE_PID" ] || die 'Docker pidfile changed during inactive recovery'
+  if [ "$INACTIVE_PID_STATE" = stale-pidfile ]; then
+    [ ! -d "$PROC_ROOT/$STALE_PID" ] || die 'Docker pid was reused during inactive recovery'
+  else
+    [ -d "$PROC_ROOT/$STALE_PID" ] && ! exact_daemon_pid "$STALE_PID" \
+      || die 'foreign Docker pid changed during inactive recovery'
+  fi
   scan_exact_processes "$EXPECTED_DOCKERD" "$DOCKERD"
   [ "$SCAN_COUNT" -eq 0 ] || die 'a Docker daemon appeared during stale recovery'
   [ "$SCAN_FOREIGN_EXE_COUNT" -eq 0 ] \
@@ -699,7 +709,7 @@ read_host_config() {
     }
     NR == 3 && schema == 2 && $1 == "DISK_SIZE_BYTES" && NF == 2 { size = $2; next }
     NR == 4 && schema == 2 && $1 == "BRIDGE_POOL_CIDR" && NF == 2 { cidr = $2; next }
-    NR == 5 && schema == 2 && $0 == "EXT4_FEATURES=^has_journal,^casefold" { features = substr($0, 15); next }
+    NR == 5 && schema == 2 && ($0 == "EXT4_FEATURES=^casefold" || $0 == "EXT4_FEATURES=^has_journal,^casefold") { features = substr($0, 15); next }
     NR == 6 && schema == 2 && $0 == "MOUNT_OPTIONS=noatime,nodev" { options = substr($0, 15); next }
     { bad = 1 }
     END {
@@ -728,7 +738,7 @@ EOF
   fi
   validate_disk_size "$DISK_SIZE_BYTES" &&
     validate_bridge_pool_cidr "$BRIDGE_POOL_CIDR" &&
-    [ "$EXT4_FEATURES" = "$EXPECTED_EXT4_FEATURES" ] &&
+    { [ "$EXT4_FEATURES" = "$EXPECTED_EXT4_FEATURES" ] || [ "$EXT4_FEATURES" = "$COMPAT_EXT4_FEATURES" ]; } &&
     [ "$MOUNT_OPTIONS" = "$EXPECTED_MOUNT_OPTIONS" ] \
     || { HOST_CONFIG_STATE=invalid; AUTOSTART_STATE=unknown; return 1; }
   if [ "$DISK_SIZE_BYTES" = 0 ]; then
@@ -1460,8 +1470,8 @@ start_host() {
   probe_daemon
   case "$DAEMON_STATE" in
     running) DAEMON_ALREADY_RUNNING=1 ;;
-    stale-pidfile)
-      remove_stale_pidfile
+    stale-pidfile|foreign-pid)
+      remove_inactive_pidfile
       DAEMON_ALREADY_RUNNING=0
       ;;
     stopped) DAEMON_ALREADY_RUNNING=0 ;;
@@ -1517,8 +1527,8 @@ stop_host() {
       printf '%s\n' 'result=stopped'
       return 0
       ;;
-    stale-pidfile)
-      remove_stale_pidfile
+    stale-pidfile|foreign-pid)
+      remove_inactive_pidfile
       printf '%s\n' 'result=stopped'
       return 0
       ;;
@@ -1620,7 +1630,7 @@ disk_init() {
   probe_daemon
   case "$DAEMON_STATE" in
     stopped) ;;
-    stale-pidfile) remove_stale_pidfile ;;
+    stale-pidfile|foreign-pid) remove_inactive_pidfile ;;
     running)
       [ -z "$DISK_INIT_SIZE" ] \
         || die 'Docker is running; refusing disk configuration change'

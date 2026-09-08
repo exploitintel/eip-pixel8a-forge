@@ -853,7 +853,7 @@ validate_existing_host_config() {
     NR == 2 && ($0 == "AUTOSTART=0" || $0 == "AUTOSTART=1") { autostart = 1; next }
     NR == 3 && schema == 2 && $1 == "DISK_SIZE_BYTES" && NF == 2 && valid_size($2) { size = 1; next }
     NR == 4 && schema == 2 && $1 == "BRIDGE_POOL_CIDR" && NF == 2 && valid_cidr($2) { cidr = 1; next }
-    NR == 5 && schema == 2 && $0 == "EXT4_FEATURES=^has_journal,^casefold" { features = 1; next }
+    NR == 5 && schema == 2 && ($0 == "EXT4_FEATURES=^casefold" || $0 == "EXT4_FEATURES=^has_journal,^casefold") { features = 1; next }
     NR == 6 && schema == 2 && $0 == "MOUNT_OPTIONS=noatime,nodev" { options = 1; next }
     { bad = 1 }
     END {

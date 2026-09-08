@@ -29,7 +29,7 @@ NETWORK_CONFIG=$(awk -F= '
   NR == 2 && ($0 == "AUTOSTART=0" || $0 == "AUTOSTART=1") { autostart=1; next }
   NR == 3 && $1 == "DISK_SIZE_BYTES" && $2 ~ /^(0|[1-9][0-9]*)$/ { disk=1; next }
   NR == 4 && $1 == "BRIDGE_POOL_CIDR" && NF == 2 { cidr=$2; next }
-  NR == 5 && $0 == "EXT4_FEATURES=^has_journal,^casefold" { features=1; next }
+  NR == 5 && ($0 == "EXT4_FEATURES=^casefold" || $0 == "EXT4_FEATURES=^has_journal,^casefold") { features=1; next }
   NR == 6 && $0 == "MOUNT_OPTIONS=noatime,nodev" { options=1; next }
   { bad=1 }
   function ip(value, a, b, c, d) {
