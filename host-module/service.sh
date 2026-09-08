@@ -33,8 +33,11 @@ done
 "$IP" rule show | grep -q '9991:.*from 172.17.0.0/16 lookup wlan0' || \
   "$IP" rule add from 172.17.0.0/16 lookup wlan0 pref 9991
 
-if grep -q '^AUTOSTART=1$' "$D/config/host.conf" && \
-   [ ! -S "$D/run/docker.sock" ]; then
-  nohup sh "$D/bin/dockerd.sh" --runtime-only \
-    >> "$D/dockerd.log" 2>&1 &
+if grep -q '^AUTOSTART=1$' "$D/config/host.conf"; then
+  if ! DOCKER_HOST=unix://$D/run/docker.sock "$D/bin/docker" info \
+       >/dev/null 2>&1; then
+    rm -f "$D/run/docker.sock" "$D/run/docker.pid"
+    nohup sh "$D/bin/dockerd.sh" --runtime-only \
+      >> "$D/dockerd.log" 2>&1 &
+  fi
 fi
