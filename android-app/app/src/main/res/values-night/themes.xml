@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ForgeControl" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowBackground">@color/forge_surface</item>
+        <item name="android:colorBackground">@color/forge_surface</item>
+        <item name="android:textColorPrimary">@color/forge_ink</item>
+        <item name="android:textColorSecondary">@color/forge_muted</item>
+        <item name="android:statusBarColor">@color/forge_surface</item>
+        <item name="android:navigationBarColor">@color/forge_surface</item>
+        <item name="android:colorAccent">@color/forge_accent</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:alertDialogTheme">@style/Theme.ForgeControl.Dialog</item>
+    </style>
+    <style name="Theme.ForgeControl.Dialog" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">@color/forge_accent</item>
+        <item name="android:colorBackground">@color/forge_raised</item>
+        <item name="android:textColorPrimary">@color/forge_ink</item>
+    </style>
+</resources>

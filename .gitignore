@@ -2,6 +2,11 @@
 .private/
 artifacts/
 kernel/out/
+android-app/build/
+.gradle/
+*.apk
+*.jks
+*.keystore
 *.part
 __pycache__/
 *.pyc

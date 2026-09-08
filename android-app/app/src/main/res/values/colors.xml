@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Forge Paper palette from the WebUI's public/operator-theme.css. -->
+    <color name="forge_ink">#17222B</color>
+    <color name="forge_surface">#F4F6F8</color>
+    <color name="forge_raised">#FFFFFF</color>
+    <color name="forge_overlay">#EDF1F4</color>
+    <color name="forge_line">#DDE4EA</color>
+    <color name="forge_muted">#5D6B77</color>
+    <color name="forge_accent">#0D6882</color>
+    <color name="forge_accent_ink">#FFFFFF</color>
+    <color name="forge_accent_dim">#1A0D6882</color>
+    <color name="forge_ok">#116C34</color>
+    <color name="forge_warning">#9A490E</color>
+    <color name="forge_error">#B62544</color>
+    <color name="forge_white">#FFFFFF</color>
+</resources>

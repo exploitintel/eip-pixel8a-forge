@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.exploitintel.forgecontrol.uipreview">
+    <application
+        android:allowBackup="false"
+        android:testOnly="true"
+        android:label="Forge UI preview"
+        android:theme="@style/Theme.ForgeControl">
+        <activity
+            android:name="com.exploitintel.forgecontrol.UiPreviewActivity"
+            android:exported="true" />
+    </application>
+    <instrumentation
+        android:name="com.exploitintel.forgecontrol.UiContractInstrumentation"
+        android:targetPackage="com.exploitintel.forgecontrol.uipreview" />
+</manifest>

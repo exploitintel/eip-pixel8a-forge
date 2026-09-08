@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Forge Dark palette from the WebUI's public/operator-theme.css. -->
+    <color name="forge_ink">#E6EDF3</color>
+    <color name="forge_surface">#0A0E12</color>
+    <color name="forge_raised">#0E141A</color>
+    <color name="forge_overlay">#131B23</color>
+    <color name="forge_line">#202C37</color>
+    <color name="forge_muted">#8B98A5</color>
+    <color name="forge_accent">#2DD4E8</color>
+    <color name="forge_accent_ink">#04252B</color>
+    <color name="forge_accent_dim">#1F2DD4E8</color>
+    <color name="forge_ok">#4ADE80</color>
+    <color name="forge_warning">#F97E3D</color>
+    <color name="forge_error">#FF5870</color>
+</resources>

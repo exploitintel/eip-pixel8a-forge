@@ -1,0 +1,57 @@
+# Android host override for the v4 container stack.
+#
+# 1. Docker socket. Android's root filesystem is read-only erofs: there is no
+#    /var and none can be created, so the base compose file's host-side
+#    "source: /var/run/docker.sock" has nothing to bind. The phone's Docker
+#    daemon keeps its socket in the data partition instead. Only the host
+#    source changes; the container target stays /var/run/docker.sock, so
+#    start.sh's socket check and everything inside the controller are
+#    untouched. Compose merges volumes by target path, so these entries
+#    replace the base bind rather than adding a second one.
+#
+# 2. Host networking. A published port cannot be reached on this phone:
+#    Android's policy routing sends the compose bridge subnet out of wlan0
+#    ("ip route get 172.18.0.2" -> via 192.168.1.1 dev wlan0), so docker-proxy
+#    accepts the connection on 127.0.0.1:7171 and then cannot reach the
+#    container, and the client sees a reset. netd owns those rule tables and
+#    refuses an "ip rule add" even as root with SELinux permissive. Host
+#    networking removes the hop entirely: node binds the phone's own loopback,
+#    with no proxy and no bridge in the path. The base file's ports mapping is
+#    invalid under host mode, hence the reset. chat kept "network_mode:
+#    service:ui" upstream, which is likewise invalid here; host mode puts it
+#    in the same namespace, which is what that setting was for.
+#
+# 3. No Ollama service. Running the Ollama binary on a phone purely as a cloud
+#    gateway is not worth its image; the controller talks to the Ollama API
+#    over https with OLLAMA_API_KEY instead.
+services:
+  ui:
+    network_mode: host
+    ports: !reset []
+    depends_on: !reset []
+    environment:
+      EIP_CVE_EXECUTION_CONTEXT: host-network-controller
+      EIP_CVE_MAINTENANCE_FILE: /run/eip-cve-control/maintenance-v1
+    volumes:
+      - type: bind
+        source: /data/docker/run/docker.sock
+        target: /var/run/docker.sock
+      - type: bind
+        source: /data/docker/eip-cve-control
+        target: /run/eip-cve-control
+        read_only: true
+  chat:
+    network_mode: host
+    environment:
+      EIP_CVE_EXECUTION_CONTEXT: host-network-controller
+      EIP_CVE_MAINTENANCE_FILE: /run/eip-cve-control/maintenance-v1
+    volumes:
+      - type: bind
+        source: /data/docker/run/docker.sock
+        target: /var/run/docker.sock
+      - type: bind
+        source: /data/docker/eip-cve-control
+        target: /run/eip-cve-control
+        read_only: true
+  ollama:
+    profiles: ["never-on-android"]

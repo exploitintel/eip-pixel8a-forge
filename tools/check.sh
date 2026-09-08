@@ -9,7 +9,8 @@ do
   python3 -m json.tool "$json_file" >/dev/null
 done
 
-for python_file in tools/assemble-module.py tools/patch-engine.py tools/swap-boot-kernel.py
+for python_file in tools/assemble-module.py tools/patch-engine.py tools/swap-boot-kernel.py \
+  eip/rebase-managed-skills.py
 do
   python3 -m py_compile "$python_file"
 done
@@ -26,6 +27,16 @@ do
     *) sh -n "$shell_file" ;;
   esac
 done
+for shell_file in eip/*.sh android-app/tools/*.sh android-app/ui-tests/run.sh
+do
+  case "$(head -n 1 "$shell_file")" in
+    '#!/bin/bash'|'#!/usr/bin/env bash') bash -n "$shell_file" ;;
+    *) sh -n "$shell_file" ;;
+  esac
+done
+
+FORGE_JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home} \
+  android-app/tools/test-host.sh
 
 python3 - <<'PY'
 import json
@@ -54,12 +65,19 @@ properties = dict(
 assert properties["id"] == "eip-pixel8a-forge"
 assert properties["name"] == "EIP Pixel 8a Forge"
 
+forge_revision = Path("FORGE_REVISION").read_text().strip()
+assert len(forge_revision) == 40
+assert all(character in "0123456789abcdef" for character in forge_revision)
+
 hostctl = Path("module/bin/hostctl").read_text()
 assert "u:object_r:vold_data_file:s0" in hostctl
 assert "RT_TABLES=/data/misc/net/rt_tables" in hostctl
 assert "PIDOF=$SYSTEM_BIN/pidof" in hostctl
 for stale in ("eip-pixel11xl-forge", "kodiak", "CD1A.260714.001.A9", "1016"):
     assert stale not in hostctl
+
+for path in (Path("eip/Dockerfile.operator"), Path("eip/build-images.sh")):
+    assert "eip-pixel11xl-forge" not in path.read_text()
 PY
 
 git diff --check
