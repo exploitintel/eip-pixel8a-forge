@@ -1,0 +1,7 @@
+.DS_Store
+.private/
+artifacts/
+kernel/out/
+*.part
+__pycache__/
+*.pyc

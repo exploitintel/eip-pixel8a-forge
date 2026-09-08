@@ -1,0 +1,9 @@
+FROM debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang-19 lld-19 llvm-19 libclang-19-dev make bc bison flex libssl-dev \
+    libelf-dev libdw-dev zlib1g-dev python3 cpio kmod git patch ca-certificates \
+    xz-utils lz4 gzip pahole file rustc rust-src bindgen rustfmt bpftool && \
+    rm -rf /var/lib/apt/lists/*
+ENV PATH=/usr/lib/llvm-19/bin:$PATH
+WORKDIR /ksrc

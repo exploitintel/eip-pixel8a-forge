@@ -1,0 +1,32 @@
+{
+  "device": "akita",
+  "model": "Pixel 8a",
+  "android_version": "17",
+  "build_id": "CP2A.260805.005",
+  "build_fingerprint": "google/akita/akita:17/CP2A.260805.005/15828068:user/release-keys",
+  "security_patch": "2026-08-05",
+  "kernel": {
+    "release": "6.1.157-android14-11-gbd23337e42e7-ab14791245",
+    "common_commit": "bd23337e42e794964a89f47596daf1209a25ee1a",
+    "source_url": "https://android.googlesource.com/kernel/common/+archive/bd23337e42e794964a89f47596daf1209a25ee1a.tar.gz",
+    "source_sha256": "b0cd75af3d749e3b866fd600815049c4c6542740175808c045acb926a4dfa000",
+    "stock_config_sha256": "3c92aa09581d812c76246b32a1020da41b12d94c089a1de2e92fce055945824f",
+    "qualified_image_sha256": "f56c2b22cbf8a9a87e5bddcabe956491f5e67f9918f92087add8fd1c766b8b54",
+    "qualified_image_lz4_sha256": "5867f1d27c3ed7f162cdab90c7e3f06277b207d5c26d4e9f481e541102b106c2",
+    "qualified_config_sha256": "2b325a74279875b301fe8d3acf7b3d6d42a2e584db3e0f72fa31b62ad246960f",
+    "qualified_boot_sha256": "9d2658a3a9031459e0f6627232e439861b764f47269314f46297624533220e26"
+  },
+  "kernelsu_next": {
+    "version": "3.3.0",
+    "kmi": "android14-6.1",
+    "qualified_init_boot_sha256": "9302c9957c191b6761ee06aacbd336641d2adae266d476b9272554bfb0a0a49e"
+  },
+  "docker": {
+    "version": "29.8.0",
+    "privns_sha256": "3656a8645f6408ed56efc34be27b4310b758ce6547301b734f67b9f2fdcca399"
+  },
+  "factory_image": {
+    "filename": "akita-cp2a.260805.005-factory-b143bf41.zip",
+    "sha256": "b143bf4128968df345dfb8ae51d09598084249606ae222a7bfd7c2c54f8c1a0c"
+  }
+}
