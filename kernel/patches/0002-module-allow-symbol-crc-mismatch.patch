@@ -1,0 +1,22 @@
+Subject: module-allow-symbol-crc-mismatch
+
+The factory vendor modules were built against Google's stock kernel. Permit a
+module CRC mismatch while retaining a visible warning. The kernel release and
+task layout are still held to the factory values.
+
+Source: android.googlesource.com/kernel/common commit bd23337e42e794964a89f47596daf1209a25ee1a
+
+--- a/kernel/module/version.c
++++ b/kernel/module/version.c
+@@ -68,8 +68,8 @@
+ 	return 1;
+ 
+ bad_version:
+-	pr_warn("%s: disagrees about version of symbol %s\n", info->name, symname);
+-	return 0;
++	pr_warn("%s: disagrees about version of symbol %s (allowed)\n", info->name, symname);
++	return 1;
+ }
+ 
+ int check_modstruct_version(const struct load_info *info,
+

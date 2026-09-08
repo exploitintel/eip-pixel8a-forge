@@ -1,0 +1,22 @@
+Subject: overlayfs-allow-casefolded-data
+
+Android's casefolded f2fs data directories set dcache hash and compare flags.
+Do not reject those directories solely for those flags when OverlayFS checks
+its upper and work paths.
+
+Source: android.googlesource.com/kernel/common commit bd23337e42e794964a89f47596daf1209a25ee1a
+
+--- a/fs/overlayfs/util.c
++++ b/fs/overlayfs/util.c
+@@ -201,9 +201,7 @@
+ 		return true;
+ 
+ 	return dentry->d_flags & (DCACHE_NEED_AUTOMOUNT |
+-				  DCACHE_MANAGE_TRANSIT |
+-				  DCACHE_OP_HASH |
+-				  DCACHE_OP_COMPARE);
++				  DCACHE_MANAGE_TRANSIT);
+ }
+ 
+ enum ovl_path_type ovl_path_type(struct dentry *dentry)
+

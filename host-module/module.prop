@@ -1,0 +1,6 @@
+id=eip_pixel8a_docker_host
+name=EIP Pixel 8a Docker Host
+version=0.1.0-dev
+versionCode=1
+author=Exploit Intel
+description=Native Docker host support for Pixel 8a Android 17.
