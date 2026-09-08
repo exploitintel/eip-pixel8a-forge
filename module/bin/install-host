@@ -1,0 +1,308 @@
+#!/system/bin/sh
+# Orchestrate the read-only gates, bounded temporary preparation, and one
+# locked host transaction. This is a subprocess of sourced customize.sh.
+set -u
+set -f
+
+PROGRAM=install-host
+BUSYBOX=/data/adb/ksu/bin/busybox
+DATA_ROOT=/data
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/*}
+INPUTS=$MODDIR/installer-inputs.tsv
+DEFAULT_CONFIG=$MODDIR/host.conf.default
+INSTALL_PREFLIGHT=$MODDIR/bin/install-preflight
+PREPARE_ENGINE=$MODDIR/bin/prepare-engine
+PREPARE_KERNEL=$MODDIR/bin/prepare-kernel
+RELEASE_TRANSACTION=$MODDIR/bin/release-transaction
+ENGINE_PREPARED=
+KERNEL_PREPARED=
+ENGINE_OWNED=0
+KERNEL_OWNED=0
+SAFETY_MARGIN_BYTES=268435456
+
+fail() {
+  printf '%s: %s\n' "$PROGRAM" "$1" >&2
+  exit "${2:-1}"
+}
+
+bb() {
+  "$BUSYBOX" "$@"
+}
+
+valid_sha256() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+canonical_unsigned() {
+  case "$1" in 0|[1-9]*) ;; *) return 1 ;; esac
+  case "$1" in *[!0-9]*) return 1 ;; esac
+}
+
+file_identity() {
+  IDENTITY_FILE=$1
+  [ -f "$IDENTITY_FILE" ] && [ ! -L "$IDENTITY_FILE" ] || return 1
+  IDENTITY_SIZE=$(bb stat -c '%s' "$IDENTITY_FILE" 2>/dev/null) || return 1
+  canonical_unsigned "$IDENTITY_SIZE" || return 1
+  IDENTITY_LINE=$(bb sha256sum "$IDENTITY_FILE" 2>/dev/null) || return 1
+  IDENTITY_OLD_IFS=$IFS
+  IFS=' '
+  # Parse the fixed sha256sum record with pathname expansion disabled.
+  # shellcheck disable=SC2086
+  set -- $IDENTITY_LINE
+  IFS=$IDENTITY_OLD_IFS
+  [ "$#" -eq 2 ] && [ "$2" = "$IDENTITY_FILE" ] && valid_sha256 "$1" || return 1
+  IDENTITY_HASH=$1
+}
+
+# Called by traps.
+# shellcheck disable=SC2329
+cleanup() {
+  if [ "$ENGINE_OWNED" = 1 ] && [ "$ENGINE_PREPARED" = "$TMPDIR/eip-engine-prepared" ]; then
+    bb rm -rf "$ENGINE_PREPARED" 2>/dev/null || true
+  fi
+  if [ "$KERNEL_OWNED" = 1 ] && [ "$KERNEL_PREPARED" = "$TMPDIR/eip-kernel-prepared" ]; then
+    bb rm -f "$KERNEL_PREPARED" 2>/dev/null || true
+  fi
+  ENGINE_OWNED=0
+  KERNEL_OWNED=0
+}
+
+# Called by signal traps.
+# shellcheck disable=SC2329
+cleanup_signal() {
+  SIGNAL_STATUS=$1
+  trap - EXIT HUP INT TERM
+  cleanup
+  exit "$SIGNAL_STATUS"
+}
+
+[ "$#" -eq 0 ] || fail 'this internal helper accepts no arguments' 2
+[ -x "$BUSYBOX" ] || fail 'KernelSU BusyBox is unavailable'
+[ "$(bb id -u 2>/dev/null || true)" = 0 ] || fail 'root is required' 2
+case "${TMPDIR:-}" in /*) ;; *) fail 'TMPDIR must be an absolute directory' 2 ;; esac
+case "$TMPDIR" in
+  /|*/../*|*/..|*/./*|*/.|*[!A-Za-z0-9_./+-]*) fail 'TMPDIR has an unsafe form' 2 ;;
+esac
+[ -d "$TMPDIR" ] && [ ! -L "$TMPDIR" ] || fail 'TMPDIR must be a real directory'
+RESOLVED_TMP=$(bb readlink -f "$TMPDIR" 2>/dev/null) || fail 'cannot resolve TMPDIR'
+[ "$RESOLVED_TMP" = "$TMPDIR" ] || fail 'TMPDIR must be a canonical real directory'
+for REQUIRED in \
+  "$INPUTS" "$DEFAULT_CONFIG" "$INSTALL_PREFLIGHT" "$PREPARE_ENGINE" \
+  "$PREPARE_KERNEL" "$RELEASE_TRANSACTION"
+do
+  [ -f "$REQUIRED" ] && [ ! -L "$REQUIRED" ] || fail "missing regular package input: $REQUIRED"
+done
+for REQUIRED_EXECUTABLE in \
+  "$INSTALL_PREFLIGHT" "$PREPARE_ENGINE" "$PREPARE_KERNEL" "$RELEASE_TRANSACTION"
+do
+  [ -x "$REQUIRED_EXECUTABLE" ] || fail "package helper is not executable: $REQUIRED_EXECUTABLE"
+done
+
+export LC_ALL=C
+umask 077
+trap cleanup EXIT
+trap 'cleanup_signal 129' HUP
+trap 'cleanup_signal 130' INT
+trap 'cleanup_signal 143' TERM
+
+PREFLIGHT_OUTPUT=$($INSTALL_PREFLIGHT) || fail 'device and boot preflight failed'
+# Parse the complete, ordered preflight output without evaluating it as shell.
+# shellcheck disable=SC2016
+PREFLIGHT_FIELDS=$(printf '%s\n' "$PREFLIGHT_OUTPUT" | bb awk -F= '
+  NR == 1 { if (NF != 2 || $1 != "INSTALL_PREFLIGHT_VERSION" || $2 != "1") exit 1; next }
+  NR == 2 { if (NF != 2 || $1 != "module_version" || $2 !~ /^[A-Za-z0-9][A-Za-z0-9._+-]*$/) exit 1; module=$2; next }
+  NR == 3 { if (NF != 2 || $1 != "build_id" || $2 !~ /^[A-Z0-9]+([.][A-Z0-9]+)+$/) exit 1; build=$2; next }
+  NR == 4 { if (NF != 2 || $1 != "slot_suffix" || $2 !~ /^_[ab]$/) exit 1; slot=$2; next }
+  NR == 5 { if (NF != 2 || $1 != "boot_state" || $2 !~ /^[a-z][a-z0-9-]*$/) exit 1; boot=$2; next }
+  NR == 6 { if (NF != 2 || $1 != "installer_inputs_sha256" || length($2) != 64 || $2 ~ /[^0-9a-f]/) exit 1; digest=$2; next }
+  NR > 6 { exit 1 }
+  END { if (NR != 6) exit 1; print module "\t" build "\t" slot "\t" boot "\t" digest }
+') || fail 'device preflight output is malformed'
+TAB=$(printf '\t')
+OLD_IFS=$IFS
+IFS=$TAB
+# Parse the fixed five-field preflight handoff.
+# shellcheck disable=SC2086
+set -- $PREFLIGHT_FIELDS
+IFS=$OLD_IFS
+[ "$#" -eq 5 ] || fail 'device preflight handoff is malformed'
+MODULE_VERSION=$1
+BUILD_ID=$2
+SLOT_SUFFIX=$3
+BOOT_STATE=$4
+PINNED_INPUT_HASH=$5
+
+file_identity "$INPUTS" || fail 'cannot hash installer inputs after preflight'
+[ "$IDENTITY_HASH" = "$PINNED_INPUT_HASH" ] || fail 'installer inputs changed after preflight'
+
+PROBE_OUTPUT=$($RELEASE_TRANSACTION probe) || fail 'host release preflight failed'
+# shellcheck disable=SC2016
+EXPECTED_ACTIVE=$(printf '%s\n' "$PROBE_OUTPUT" | bb awk -F= '
+  NR == 1 { if (NF != 2 || $1 != "TRANSACTION_PROBE_VERSION" || $2 != "1") exit 1; next }
+  NR == 2 {
+    if (NF != 2 || ($2 != "none" && $2 !~ /^[A-Za-z0-9][A-Za-z0-9._+-]*$/)) exit 1
+    active=$2
+    next
+  }
+  NR > 2 { exit 1 }
+  END { if (NR != 2) exit 1; print active }
+') || fail 'host release preflight output is malformed'
+
+# Compute separate conservative peaks for KernelSU's temporary filesystem and
+# persistent /data. KernelSU normally provides a tmpfs TMPDIR; free RAM there
+# says nothing about room for the finalized release under /data/docker.
+# install-preflight already validated the complete grammar; this pass binds the
+# space arithmetic to its exact hash and selected build.
+# shellcheck disable=SC2016
+SPACE_FIELDS=$(bb awk -F "$TAB" -v build="$BUILD_ID" '
+  $1 == "ENGINE" { archive=$4; engines++; next }
+  $1 == "BINARY" { runtime += $3; binaries++; next }
+  $1 == "BUILD" && $2 == build { partition=$8; builds++; next }
+  $1 == "BOOT_STATE" && $2 == build && $3 == "current-public" { kernel=$4; kernels++; next }
+  END {
+    if (engines != 1 || binaries != 8 || builds != 1 || kernels != 1 ||
+        archive !~ /^[1-9][0-9]*$/ || runtime <= 0 || partition !~ /^[1-9][0-9]*$/ ||
+        kernel !~ /^[1-9][0-9]*$/) exit 1
+    printf "%.0f\t%.0f\t%.0f\t%.0f\n", archive, runtime, kernel, partition
+  }
+' "$INPUTS") || fail 'cannot derive installer space requirements'
+IFS=$TAB
+# Parse the fixed four-field space record.
+# shellcheck disable=SC2086
+set -- $SPACE_FIELDS
+IFS=$OLD_IFS
+[ "$#" -eq 4 ] || fail 'installer space requirements are malformed'
+ARCHIVE_SIZE=$1
+RUNTIME_SIZE=$2
+KERNEL_SIZE=$3
+PARTITION_SIZE=$4
+for VALUE in "$ARCHIVE_SIZE" "$RUNTIME_SIZE" "$KERNEL_SIZE" "$PARTITION_SIZE"; do
+  canonical_unsigned "$VALUE" && [ "$VALUE" -gt 0 ] || fail 'installer space requirement is invalid'
+done
+TMP_REQUIRED_BYTES=$((ARCHIVE_SIZE + 2 * RUNTIME_SIZE + KERNEL_SIZE + SAFETY_MARGIN_BYTES))
+DATA_REQUIRED_BYTES=$((RUNTIME_SIZE + KERNEL_SIZE + SAFETY_MARGIN_BYTES))
+[ "$TMP_REQUIRED_BYTES" -gt "$SAFETY_MARGIN_BYTES" ] \
+  && [ "$DATA_REQUIRED_BYTES" -gt "$SAFETY_MARGIN_BYTES" ] \
+  || fail 'installer space arithmetic overflowed'
+# The single-quoted program is awk source, not shell interpolation.
+# shellcheck disable=SC2016
+TMP_AVAILABLE_KIB=$(bb df -Pk "$TMPDIR" 2>/dev/null | bb awk '
+  NR > 1 && $4 ~ /^[0-9]+$/ { value=$4; found++ }
+  END { if (found < 1) exit 1; print value }
+') || fail 'cannot measure installer temporary filesystem free space'
+canonical_unsigned "$TMP_AVAILABLE_KIB" \
+  || fail 'installer temporary filesystem free space is malformed'
+bb awk -v available="$TMP_AVAILABLE_KIB" -v required="$TMP_REQUIRED_BYTES" \
+  'BEGIN { exit !((available * 1024) >= required) }' \
+  || fail "insufficient temporary free space: need $TMP_REQUIRED_BYTES bytes, have $TMP_AVAILABLE_KIB KiB"
+DATA_AVAILABLE_KIB=$(bb df -Pk "$DATA_ROOT" 2>/dev/null | bb awk '
+  NR > 1 && $4 ~ /^[0-9]+$/ { value=$4; found++ }
+  END { if (found < 1) exit 1; print value }
+') || fail 'cannot measure persistent data filesystem free space'
+canonical_unsigned "$DATA_AVAILABLE_KIB" \
+  || fail 'persistent data filesystem free space is malformed'
+bb awk -v available="$DATA_AVAILABLE_KIB" -v required="$DATA_REQUIRED_BYTES" \
+  'BEGIN { exit !((available * 1024) >= required) }' \
+  || fail "insufficient persistent data free space: need $DATA_REQUIRED_BYTES bytes, have $DATA_AVAILABLE_KIB KiB"
+file_identity "$INPUTS" || fail 'cannot rehash installer inputs after space check'
+[ "$IDENTITY_HASH" = "$PINNED_INPUT_HASH" ] || fail 'installer inputs changed during space check'
+
+ENGINE_OUTPUT=$($PREPARE_ENGINE) || fail 'Docker Engine preparation failed'
+ENGINE_PREPARED=$TMPDIR/eip-engine-prepared
+ENGINE_OWNED=1
+# shellcheck disable=SC2016
+ENGINE_FIELDS=$(printf '%s\n' "$ENGINE_OUTPUT" | bb awk -F= '
+  NR == 1 { if (NF != 2 || $1 != "ENGINE_PREPARE_VERSION" || $2 != "1") exit 1; next }
+  NR == 2 { if (NF != 2 || $1 != "engine_version") exit 1; version=$2; next }
+  NR == 3 { if (NF != 2 || $1 != "acquisition_source" || $2 !~ /^(cache|sideload|download)$/) exit 1; source=$2; next }
+  NR == 4 { if (NF != 2 || $1 != "prepared_path") exit 1; prepared=$2; next }
+  NR == 5 { if (NF != 2 || $1 != "manifest_path") exit 1; manifest=$2; next }
+  NR == 6 { if (NF != 2 || $1 != "installer_inputs_sha256") exit 1; inputs=$2; next }
+  NR == 7 { if (NF != 2 || $1 != "release_manifest_sha256") exit 1; release=$2; next }
+  NR > 7 { exit 1 }
+  END { if (NR != 7) exit 1; print version "\t" source "\t" prepared "\t" manifest "\t" inputs "\t" release }
+') || fail 'engine preparation output is malformed'
+IFS=$TAB
+# Parse the fixed six-field engine handoff.
+# shellcheck disable=SC2086
+set -- $ENGINE_FIELDS
+IFS=$OLD_IFS
+[ "$#" -eq 6 ] || fail 'engine preparation handoff is malformed'
+ENGINE_VERSION=$1
+ENGINE_SOURCE_KIND=$2
+[ "$3" = "$ENGINE_PREPARED" ] && [ "$4" = "$MODDIR/release-manifest.tsv" ] \
+  && [ "$5" = "$PINNED_INPUT_HASH" ] && valid_sha256 "$6" \
+  || fail 'engine preparation handoff does not match this package'
+RELEASE_MANIFEST_HASH=$6
+file_identity "$MODDIR/release-manifest.tsv" || fail 'cannot hash release manifest'
+[ "$IDENTITY_HASH" = "$RELEASE_MANIFEST_HASH" ] \
+  || fail 'release manifest changed after engine preparation'
+
+KERNEL_OUTPUT=$($PREPARE_KERNEL "$BUILD_ID" "$PINNED_INPUT_HASH") \
+  || fail 'kernel candidate preparation failed'
+KERNEL_PREPARED=$TMPDIR/eip-kernel-prepared
+KERNEL_OWNED=1
+# shellcheck disable=SC2016
+KERNEL_FIELDS=$(printf '%s\n' "$KERNEL_OUTPUT" | bb awk -F= '
+  NR == 1 { if (NF != 2 || $1 != "KERNEL_PREPARE_VERSION" || $2 != "1") exit 1; next }
+  NR == 2 { if (NF != 2 || $1 != "build_id") exit 1; build=$2; next }
+  NR == 3 { if (NF != 2 || $1 != "acquisition_source" || $2 !~ /^(cache|sideload)$/) exit 1; source=$2; next }
+  NR == 4 { if (NF != 2 || $1 != "prepared_path") exit 1; prepared=$2; next }
+  NR == 5 { if (NF != 2 || $1 != "image_size") exit 1; size=$2; next }
+  NR == 6 { if (NF != 2 || $1 != "image_sha256") exit 1; digest=$2; next }
+  NR == 7 { if (NF != 2 || $1 != "installer_inputs_sha256") exit 1; inputs=$2; next }
+  NR > 7 { exit 1 }
+  END { if (NR != 7) exit 1; print build "\t" source "\t" prepared "\t" size "\t" digest "\t" inputs }
+') || fail 'kernel preparation output is malformed'
+IFS=$TAB
+# Parse the fixed six-field kernel handoff.
+# shellcheck disable=SC2086
+set -- $KERNEL_FIELDS
+IFS=$OLD_IFS
+[ "$#" -eq 6 ] || fail 'kernel preparation handoff is malformed'
+KERNEL_SOURCE_KIND=$2
+[ "$1" = "$BUILD_ID" ] && [ "$3" = "$KERNEL_PREPARED" ] \
+  && [ "$4" = "$KERNEL_SIZE" ] && valid_sha256 "$5" \
+  && [ "$6" = "$PINNED_INPUT_HASH" ] \
+  || fail 'kernel preparation handoff does not match preflight'
+KERNEL_HASH=$5
+
+file_identity "$DEFAULT_CONFIG" || fail 'cannot identify default host config'
+DEFAULT_CONFIG_SIZE=$IDENTITY_SIZE
+DEFAULT_CONFIG_HASH=$IDENTITY_HASH
+TRANSACTION_OUTPUT=$($RELEASE_TRANSACTION stage-install \
+  "$MODULE_VERSION" "$ENGINE_PREPARED" "$MODDIR/release-manifest.tsv" "$EXPECTED_ACTIVE" \
+  "$BUILD_ID" "$KERNEL_PREPARED" "$KERNEL_SIZE" "$KERNEL_HASH" \
+  "$DEFAULT_CONFIG" "$DEFAULT_CONFIG_SIZE" "$DEFAULT_CONFIG_HASH")
+TRANSACTION_STATUS=$?
+[ "$TRANSACTION_STATUS" -eq 0 ] || exit "$TRANSACTION_STATUS"
+# shellcheck disable=SC2016
+TRANSACTION_RESULT=$(printf '%s\n' "$TRANSACTION_OUTPUT" | bb awk -F= -v expected="$MODULE_VERSION" '
+  NR == 1 { if (NF != 2 || $1 != "result" || $2 !~ /^(activated|already-active)$/) exit 1; result=$2; next }
+  NR == 2 { if (NF != 2 || $1 != "active" || $2 != expected) exit 1; next }
+  NR == 3 { if (NF != 2 || $1 != "previous") exit 1; previous=$2; next }
+  NR > 3 { exit 1 }
+  END { if (NR != 3) exit 1; print result "\t" previous }
+') || fail 'host transaction output is malformed'
+IFS=$TAB
+# Parse the fixed two-field transaction result.
+# shellcheck disable=SC2086
+set -- $TRANSACTION_RESULT
+IFS=$OLD_IFS
+[ "$#" -eq 2 ] || fail 'host transaction result is malformed'
+
+printf '%s\n' \
+  'INSTALL_HOST_VERSION=1' \
+  "result=$1" \
+  "module_version=$MODULE_VERSION" \
+  "build_id=$BUILD_ID" \
+  "slot_suffix=$SLOT_SUFFIX" \
+  "boot_state=$BOOT_STATE" \
+  "engine_version=$ENGINE_VERSION" \
+  "engine_source=$ENGINE_SOURCE_KIND" \
+  "kernel_source=$KERNEL_SOURCE_KIND" \
+  "previous=$2" \
+  'autostart=off-or-preserved'
+exit 0

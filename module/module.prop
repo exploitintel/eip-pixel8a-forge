@@ -1,0 +1,6 @@
+id=eip-pixel8a-forge
+name=EIP Pixel 8a Forge
+version=0.1.0-rc.5
+versionCode=7
+author=Exploit Intel
+description=Pixel 8a Docker host installer (Wi-Fi only)

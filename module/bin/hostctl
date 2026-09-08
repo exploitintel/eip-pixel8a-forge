@@ -1,0 +1,1677 @@
+#!/system/bin/sh
+# Root-only lifecycle authority for the generic Android Docker host. It owns
+# disk preparation and Wi-Fi policy around the reviewed dockerd.sh
+# --runtime-only path. An optional, root-provisioned workload profile has two
+# fixed lifecycle phases. This script never pulls content, force-kills,
+# reformats an existing image, or unmounts.
+set -u
+
+DOCKER_ROOT=/data/docker
+PROC_ROOT=/proc
+SYSTEM_BIN=/system/bin
+KSU_BUSYBOX=/data/adb/ksu/bin/busybox
+RT_TABLES=/data/misc/net/rt_tables
+SYS_CLASS_NET=/sys/class/net
+KERNEL_CONFIG=/proc/config.gz
+PATH=$SYSTEM_BIN
+export PATH
+
+DOCKER=$DOCKER_ROOT/bin/docker
+DOCKERD=$DOCKER_ROOT/bin/dockerd
+CONTAINERD=$DOCKER_ROOT/bin/containerd
+DOCKERD_SCRIPT=$DOCKER_ROOT/bin/dockerd.sh
+RUN_ROOT=$DOCKER_ROOT/run
+DOCKER_SOCKET=$RUN_ROOT/docker.sock
+DOCKER_PIDFILE=$RUN_ROOT/docker.pid
+LOCK_DIR=$RUN_ROOT/host-lifecycle.lock
+LOCK_OWNER=$LOCK_DIR/pid
+LOCK_RECOVERY=$LOCK_DIR/.recovery
+CONFIG_DIR=$DOCKER_ROOT/config
+CONFIG_FILE=$CONFIG_DIR/host.conf
+WORKLOAD_PROFILE_FILE=$CONFIG_DIR/workload-profile.conf
+WORKLOAD_PROFILES_ROOT=$DOCKER_ROOT/workload-profiles
+DOCKER_DISK=$DOCKER_ROOT/disk.img
+DOCKER_DATA=$DOCKER_ROOT/lib
+MOUNTS=/proc/mounts
+IP_FORWARD=/proc/sys/net/ipv4/ip_forward
+ID=$SYSTEM_BIN/id
+CHCON=$SYSTEM_BIN/chcon
+DF=$SYSTEM_BIN/df
+E2FSCK=$SYSTEM_BIN/e2fsck
+ENV=$SYSTEM_BIN/env
+IP=$SYSTEM_BIN/ip
+IPTABLES=$SYSTEM_BIN/iptables
+KILL=$SYSTEM_BIN/kill
+LN=$SYSTEM_BIN/ln
+LOSETUP=$SYSTEM_BIN/losetup
+MKE2FS=$SYSTEM_BIN/mke2fs
+MOUNT=$SYSTEM_BIN/mount
+PIDOF=$SYSTEM_BIN/pidof
+READLINK=$SYSTEM_BIN/readlink
+SETSID=$SYSTEM_BIN/setsid
+SLEEP=$SYSTEM_BIN/sleep
+STAT=$SYSTEM_BIN/stat
+SHA256SUM=$SYSTEM_BIN/sha256sum
+SYNC=$SYSTEM_BIN/sync
+TRUNCATE=$SYSTEM_BIN/truncate
+READY_TRIES=30
+STOP_TRIES=30
+SLEEP_SECONDS=2
+WORKLOAD_HOOK_TIMEOUT_SECONDS=240
+WORKLOAD_HOOK_KILL_GRACE_SECONDS=5
+DISK_MIN_BYTES=268435456
+DISK_MAX_BYTES=1099511627776
+DISK_FREE_MARGIN_BYTES=1073741824
+DEFAULT_BRIDGE_POOL_CIDR=172.17.0.0/16
+EXPECTED_ROOT_OWNER=0:0
+EXPECTED_EXT4_FEATURES='^casefold'
+COMPAT_EXT4_FEATURES='^has_journal,^casefold'
+EXPECTED_MOUNT_OPTIONS=noatime,nodev
+DOCKER_HOST=unix://$DOCKER_SOCKET
+export DOCKER_HOST
+
+LOCK_OWNED=0
+LOCK_RECOVERY_OWNED=0
+CONFIG_TEMP=
+DISK_TEMP=
+CREATED_LOOP=
+ROUTE_POLICY_TEMP=
+ROUTE_POLICY_IMAGE=
+WORKLOAD_PROFILE_STATE=none
+WORKLOAD_PROFILE_ID=
+WORKLOAD_PROFILE_DIR=
+WORKLOAD_PROFILE_HOOK=
+WORKLOAD_LOCK_DIR_IDENTITY=
+WORKLOAD_LOCK_OWNER_IDENTITY=
+
+cleanup_route_policy_artifacts() {
+  if [ -n "$ROUTE_POLICY_IMAGE" ]; then
+    case "$ROUTE_POLICY_IMAGE" in
+      sha256:*)
+        [ -x "$EXPECTED_DOCKER" ] &&
+          "$EXPECTED_DOCKER" image rm "$ROUTE_POLICY_IMAGE" >/dev/null 2>&1 || true
+        ;;
+    esac
+    ROUTE_POLICY_IMAGE=
+  fi
+  if [ -n "$ROUTE_POLICY_TEMP" ]; then
+    case "$ROUTE_POLICY_TEMP" in
+      "$RUN_ROOT"/.route-policy.*)
+        if [ -d "$ROUTE_POLICY_TEMP" ] && [ ! -L "$ROUTE_POLICY_TEMP" ]; then
+          rm -f "$ROUTE_POLICY_TEMP/rootfs/route-policy" \
+            "$ROUTE_POLICY_TEMP/rootfs.tar" 2>/dev/null || true
+          rmdir "$ROUTE_POLICY_TEMP/rootfs" 2>/dev/null || true
+          rmdir "$ROUTE_POLICY_TEMP" 2>/dev/null || true
+        fi
+        ;;
+    esac
+    ROUTE_POLICY_TEMP=
+  fi
+}
+
+usage() {
+  printf '%s\n' 'usage: hostctl status|start|stop|autostart on|off|disk-init [--size-bytes BYTES]' >&2
+  exit 2
+}
+
+die() {
+  printf 'hostctl: %s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+release_lock() {
+  cleanup_route_policy_artifacts
+  if [ -n "$CONFIG_TEMP" ]; then
+    rm -f "$CONFIG_TEMP" 2>/dev/null || true
+    CONFIG_TEMP=
+  fi
+  if [ -n "$DISK_TEMP" ]; then
+    case "$DISK_TEMP" in
+      "$DOCKER_ROOT"/.disk.img.hostctl.*)
+        [ -f "$DISK_TEMP" ] && [ ! -L "$DISK_TEMP" ] && rm -f "$DISK_TEMP" 2>/dev/null || true
+        ;;
+    esac
+    DISK_TEMP=
+  fi
+  if [ -n "$CREATED_LOOP" ]; then
+    LOOP_STILL_MOUNTED=$("$SYSTEM_BIN/awk" -v source="$CREATED_LOOP" '$1 == source { found = 1 } END { print found ? "yes" : "no" }' "$MOUNTS" 2>/dev/null || printf unknown)
+    if [ "$LOOP_STILL_MOUNTED" = no ]; then
+      resolve_disk_loops >/dev/null 2>&1 || true
+      if [ "$DISK_LOOP_STATE" = ready ] && [ "$DISK_LOOP" = "$CREATED_LOOP" ]; then
+        "$LOSETUP" -d "$CREATED_LOOP" 2>/dev/null || true
+      fi
+    fi
+    CREATED_LOOP=
+  fi
+  [ "$LOCK_OWNED" = 1 ] || return 0
+  if [ -f "$LOCK_OWNER" ] && [ ! -L "$LOCK_OWNER" ] &&
+     [ "$(cat "$LOCK_OWNER" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$LOCK_OWNER" 2>/dev/null || true
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  LOCK_OWNED=0
+}
+
+release_for_signal() {
+  SIGNAL_STATUS=$1
+  trap - EXIT HUP INT TERM
+  release_lock
+  exit "$SIGNAL_STATUS"
+}
+
+abort_lock_recovery() {
+  RECOVERY_ERROR=$1
+  if [ "$LOCK_RECOVERY_OWNED" = 1 ]; then
+    if ! rmdir "$LOCK_RECOVERY" 2>/dev/null; then
+      die "$RECOVERY_ERROR; recovery claim could not be cleared"
+    fi
+    LOCK_RECOVERY_OWNED=0
+  fi
+  die "$RECOVERY_ERROR"
+}
+
+acquire_lock() {
+  [ -d "$RUN_ROOT" ] && [ ! -L "$RUN_ROOT" ] || die 'Docker run directory is unavailable'
+  LOCK_RECOVERED=0
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ] || die 'lifecycle lock is ambiguous; refusing recovery'
+    [ -f "$LOCK_OWNER" ] && [ ! -L "$LOCK_OWNER" ] || die 'lifecycle lock owner is malformed; refusing recovery'
+    LOCK_PID=$(cat "$LOCK_OWNER" 2>/dev/null) || die 'cannot read lifecycle lock owner'
+    case "$LOCK_PID" in
+      ''|*[!0-9]*) die 'lifecycle lock owner is malformed; refusing recovery' ;;
+    esac
+    [ "$LOCK_PID" -gt 1 ] 2>/dev/null || die 'lifecycle lock owner is malformed; refusing recovery'
+    LOCK_CONTENTS=$(LC_ALL=C ls -A "$LOCK_DIR" 2>/dev/null) || die 'cannot inspect lifecycle lock'
+    [ "$LOCK_CONTENTS" = pid ] || die 'lifecycle lock contains unexpected state; refusing recovery'
+    [ -d "$PROC_ROOT" ] && [ ! -L "$PROC_ROOT" ] \
+      || die 'process directory is unavailable; refusing lock recovery'
+    [ ! -d "$PROC_ROOT/$LOCK_PID" ] || die 'another lifecycle operation is in progress'
+    mkdir "$LOCK_RECOVERY" 2>/dev/null || die 'another lifecycle operation is in progress'
+    LOCK_RECOVERY_OWNED=1
+    [ -f "$LOCK_OWNER" ] && [ ! -L "$LOCK_OWNER" ] \
+      || abort_lock_recovery 'lifecycle lock owner changed during stale recovery'
+    RECOVERY_PID=$(cat "$LOCK_OWNER" 2>/dev/null) \
+      || abort_lock_recovery 'cannot re-read lifecycle lock owner during stale recovery'
+    [ "$RECOVERY_PID" = "$LOCK_PID" ] \
+      || abort_lock_recovery 'lifecycle lock owner changed during stale recovery'
+    [ -d "$PROC_ROOT" ] && [ ! -L "$PROC_ROOT" ] \
+      || abort_lock_recovery 'process directory changed during stale recovery'
+    [ ! -d "$PROC_ROOT/$LOCK_PID" ] \
+      || abort_lock_recovery 'lifecycle lock owner became live during stale recovery'
+    RECOVERY_CONTENTS=$(LC_ALL=C ls -A "$LOCK_DIR" 2>/dev/null) \
+      || abort_lock_recovery 'cannot re-inspect lifecycle lock during stale recovery'
+    EXPECTED_RECOVERY_CONTENTS=$(printf '%s\n%s\n' .recovery pid)
+    [ "$RECOVERY_CONTENTS" = "$EXPECTED_RECOVERY_CONTENTS" ] \
+      || abort_lock_recovery 'lifecycle lock changed during stale recovery'
+    chmod 0700 "$LOCK_DIR" \
+      || abort_lock_recovery 'cannot protect lifecycle lock during stale recovery'
+    (umask 077; printf '%s\n' "$$" > "$LOCK_OWNER") \
+      || abort_lock_recovery 'cannot record recovered lifecycle lock owner'
+    chmod 0600 "$LOCK_OWNER" \
+      || abort_lock_recovery 'cannot protect recovered lifecycle lock owner'
+    if ! rmdir "$LOCK_RECOVERY"; then
+      die 'cannot clear lifecycle lock recovery claim'
+    fi
+    LOCK_RECOVERY_OWNED=0
+    LOCK_RECOVERED=1
+  fi
+  if [ "$LOCK_RECOVERED" = 0 ]; then
+    chmod 0700 "$LOCK_DIR" || { rmdir "$LOCK_DIR" 2>/dev/null || true; die 'cannot protect lifecycle lock'; }
+    (umask 077; printf '%s\n' "$$" > "$LOCK_OWNER") || {
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      die 'cannot record lifecycle lock owner'
+    }
+    chmod 0600 "$LOCK_OWNER" || {
+      rm -f "$LOCK_OWNER" 2>/dev/null || true
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      die 'cannot protect lifecycle lock owner'
+    }
+  fi
+  LOCK_OWNED=1
+  trap release_lock EXIT
+  trap 'release_for_signal 129' HUP
+  trap 'release_for_signal 130' INT
+  trap 'release_for_signal 143' TERM
+}
+
+resolve_active_release() {
+  ACTIVE_RELEASE=
+  EXPECTED_DOCKER=
+  EXPECTED_DOCKERD=
+  EXPECTED_CONTAINERD=
+  EXPECTED_DOCKERD_SCRIPT=
+  EXPECTED_ROUTE_POLICY=
+  [ -L "$DOCKER_ROOT/bin" ] || return 1
+  ACTIVE_RELEASE=$("$READLINK" -f "$DOCKER_ROOT/bin" 2>/dev/null) || return 1
+  case "$ACTIVE_RELEASE" in
+    "$DOCKER_ROOT"/releases/*) ;;
+    *) return 1 ;;
+  esac
+  RELEASE_NAME=${ACTIVE_RELEASE#"$DOCKER_ROOT"/releases/}
+  case "$RELEASE_NAME" in
+    ''|*/*|*[!A-Za-z0-9._+-]*) return 1 ;;
+  esac
+  [ -d "$ACTIVE_RELEASE" ] && [ ! -L "$ACTIVE_RELEASE" ] || return 1
+  for RELEASE_EXECUTABLE in docker dockerd containerd dockerd.sh route-policy; do
+    [ -f "$ACTIVE_RELEASE/$RELEASE_EXECUTABLE" ] &&
+      [ ! -L "$ACTIVE_RELEASE/$RELEASE_EXECUTABLE" ] || return 1
+  done
+  EXPECTED_DOCKER=$("$READLINK" -f "$DOCKER" 2>/dev/null) || return 1
+  EXPECTED_DOCKERD=$("$READLINK" -f "$DOCKERD" 2>/dev/null) || return 1
+  EXPECTED_CONTAINERD=$("$READLINK" -f "$CONTAINERD" 2>/dev/null) || return 1
+  EXPECTED_DOCKERD_SCRIPT=$("$READLINK" -f "$DOCKERD_SCRIPT" 2>/dev/null) || return 1
+  EXPECTED_ROUTE_POLICY=$("$READLINK" -f "$DOCKER_ROOT/bin/route-policy" 2>/dev/null) || return 1
+  [ "$EXPECTED_DOCKER" = "$ACTIVE_RELEASE/docker" ] || return 1
+  [ "$EXPECTED_DOCKERD" = "$ACTIVE_RELEASE/dockerd" ] || return 1
+  [ "$EXPECTED_CONTAINERD" = "$ACTIVE_RELEASE/containerd" ] || return 1
+  [ "$EXPECTED_DOCKERD_SCRIPT" = "$ACTIVE_RELEASE/dockerd.sh" ] || return 1
+  [ "$EXPECTED_ROUTE_POLICY" = "$ACTIVE_RELEASE/route-policy" ] || return 1
+  return 0
+}
+
+process_argv0_matches() {
+  ARGV_PID=$1
+  ARGV_EXPECTED=$2
+  ARGV_FILE=$PROC_ROOT/$ARGV_PID/cmdline
+  [ -f "$ARGV_FILE" ] && [ ! -L "$ARGV_FILE" ] || return 1
+  ARGV_ACTUAL=
+  IFS= read -r -d '' ARGV_ACTUAL < "$ARGV_FILE" 2>/dev/null || return 1
+  [ -n "$ARGV_ACTUAL" ] && [ "$ARGV_ACTUAL" = "$ARGV_EXPECTED" ]
+}
+
+is_versioned_release_executable() {
+  CANDIDATE_EXECUTABLE=$1
+  CANDIDATE_COMPONENT=$2
+  case "$CANDIDATE_EXECUTABLE" in
+    "$DOCKER_ROOT"/releases/*/"$CANDIDATE_COMPONENT") ;;
+    *) return 1 ;;
+  esac
+  CANDIDATE_RELEASE=${CANDIDATE_EXECUTABLE#"$DOCKER_ROOT"/releases/}
+  CANDIDATE_RELEASE=${CANDIDATE_RELEASE%/"$CANDIDATE_COMPONENT"}
+  case "$CANDIDATE_RELEASE" in
+    ''|*/*|*[!A-Za-z0-9._+-]*) return 1 ;;
+  esac
+  return 0
+}
+
+scan_exact_processes() {
+  SCAN_EXECUTABLE=$1
+  SCAN_EXPECTED_ARGV0=${2:-}
+  SCAN_ALLOWED_BASENAME=${3:-}
+  SCAN_COMPONENT=${SCAN_EXECUTABLE##*/}
+  SCAN_COUNT=0
+  SCAN_ARGV0_MISMATCH_COUNT=0
+  SCAN_FOREIGN_EXE_COUNT=0
+  SCAN_PID=
+  [ -x "$PIDOF" ] || { SCAN_FOREIGN_EXE_COUNT=1; return; }
+  SCAN_PIDS=$("$PIDOF" "$SCAN_COMPONENT" 2>/dev/null) || SCAN_PIDS=
+  for SCAN_CANDIDATE in $SCAN_PIDS; do
+    case "$SCAN_CANDIDATE" in ''|*[!0-9]*) SCAN_FOREIGN_EXE_COUNT=$((SCAN_FOREIGN_EXE_COUNT + 1)); continue ;; esac
+    [ -d "$PROC_ROOT/$SCAN_CANDIDATE" ] || continue
+    SCAN_RESOLVED=$("$READLINK" -f "$PROC_ROOT/$SCAN_CANDIDATE/exe" 2>/dev/null) || SCAN_RESOLVED=
+    if [ "$SCAN_RESOLVED" = "$SCAN_EXECUTABLE" ]; then
+      if [ -n "$SCAN_EXPECTED_ARGV0" ] &&
+         ! process_argv0_matches "$SCAN_CANDIDATE" "$SCAN_EXPECTED_ARGV0" &&
+         { [ -z "$SCAN_ALLOWED_BASENAME" ] ||
+           ! process_argv0_matches "$SCAN_CANDIDATE" "$SCAN_ALLOWED_BASENAME"; }; then
+        SCAN_ARGV0_MISMATCH_COUNT=$((SCAN_ARGV0_MISMATCH_COUNT + 1))
+      else
+        SCAN_COUNT=$((SCAN_COUNT + 1))
+        SCAN_PID=$SCAN_CANDIDATE
+      fi
+    else
+      SCAN_FOREIGN_EXE_COUNT=$((SCAN_FOREIGN_EXE_COUNT + 1))
+    fi
+  done
+}
+
+read_pidfile() {
+  READ_PID=
+  [ -f "$DOCKER_PIDFILE" ] && [ ! -L "$DOCKER_PIDFILE" ] || return 1
+  READ_PID=$(cat "$DOCKER_PIDFILE" 2>/dev/null) || return 1
+  case "$READ_PID" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$READ_PID" -gt 1 ] 2>/dev/null || return 1
+  return 0
+}
+
+docker_info() {
+  [ -x "$EXPECTED_DOCKER" ] && "$EXPECTED_DOCKER" info >/dev/null 2>&1
+}
+
+socket_present() {
+  [ -e "$DOCKER_SOCKET" ] || [ -L "$DOCKER_SOCKET" ]
+}
+
+exact_daemon_pid() {
+  EXACT_PID=$1
+  [ -d "$PROC_ROOT/$EXACT_PID" ] || return 1
+  EXACT_EXE=$("$READLINK" -f "$PROC_ROOT/$EXACT_PID/exe" 2>/dev/null) || return 1
+  [ "$EXACT_EXE" = "$EXPECTED_DOCKERD" ] || return 1
+  process_argv0_matches "$EXACT_PID" "$DOCKERD"
+}
+
+probe_daemon() {
+  DAEMON_PID=
+  DAEMON_STATE=ambiguous
+  if ! resolve_active_release; then
+    DAEMON_STATE=invalid-active-release
+    return
+  fi
+
+  scan_exact_processes "$EXPECTED_DOCKERD" "$DOCKERD"
+  DOCKERD_COUNT=$SCAN_COUNT
+  DOCKERD_ARGV0_MISMATCH_COUNT=$SCAN_ARGV0_MISMATCH_COUNT
+  DOCKERD_FOREIGN_EXE_COUNT=$SCAN_FOREIGN_EXE_COUNT
+  FOUND_DOCKERD_PID=$SCAN_PID
+  # dockerd commonly launches containerd with the basename as argv[0]. The
+  # resolved executable and unique release ownership are the stable identity.
+  scan_exact_processes "$EXPECTED_CONTAINERD" "$CONTAINERD" containerd
+  CONTAINERD_COUNT=$SCAN_COUNT
+  CONTAINERD_ARGV0_MISMATCH_COUNT=$SCAN_ARGV0_MISMATCH_COUNT
+  CONTAINERD_FOREIGN_EXE_COUNT=$SCAN_FOREIGN_EXE_COUNT
+  [ "$DOCKERD_FOREIGN_EXE_COUNT" -eq 0 ] \
+    || { DAEMON_STATE=daemon-exe-mismatch; return; }
+  [ "$DOCKERD_ARGV0_MISMATCH_COUNT" -eq 0 ] \
+    || { DAEMON_STATE=daemon-argv0-mismatch; return; }
+  [ "$CONTAINERD_FOREIGN_EXE_COUNT" -eq 0 ] \
+    || { DAEMON_STATE=containerd-exe-mismatch; return; }
+  [ "$CONTAINERD_ARGV0_MISMATCH_COUNT" -eq 0 ] \
+    || { DAEMON_STATE=containerd-argv0-mismatch; return; }
+  [ "$DOCKERD_COUNT" -le 1 ] || { DAEMON_STATE=multiple-daemons; return; }
+  [ "$CONTAINERD_COUNT" -le 1 ] || { DAEMON_STATE=multiple-containerd; return; }
+
+  if [ ! -e "$DOCKER_PIDFILE" ] && [ ! -L "$DOCKER_PIDFILE" ]; then
+    if [ "$DOCKERD_COUNT" -eq 1 ]; then
+      DAEMON_PID=$FOUND_DOCKERD_PID
+      DAEMON_STATE=unmanaged-daemon
+    elif [ "$CONTAINERD_COUNT" -ne 0 ]; then
+      DAEMON_STATE=orphan-containerd
+    elif docker_info || socket_present; then
+      DAEMON_STATE=unmanaged-daemon
+    else
+      DAEMON_STATE=stopped
+    fi
+    return
+  fi
+
+  if ! read_pidfile; then
+    DAEMON_STATE=invalid-pidfile
+    return
+  fi
+  DAEMON_PID=$READ_PID
+  if [ ! -d "$PROC_ROOT/$DAEMON_PID" ]; then
+    if [ "$DOCKERD_COUNT" -ne 0 ]; then
+      DAEMON_STATE=pidfile-mismatch
+    elif [ "$CONTAINERD_COUNT" -ne 0 ]; then
+      DAEMON_STATE=orphan-containerd
+    elif docker_info || socket_present; then
+      DAEMON_STATE=unmanaged-daemon
+    else
+      DAEMON_STATE=stale-pidfile
+    fi
+    return
+  fi
+  if ! exact_daemon_pid "$DAEMON_PID"; then
+    DAEMON_STATE=foreign-pid
+    return
+  fi
+  if [ "$DOCKERD_COUNT" -ne 1 ] || [ "$FOUND_DOCKERD_PID" != "$DAEMON_PID" ]; then
+    DAEMON_STATE=pidfile-mismatch
+    return
+  fi
+  if docker_info; then
+    DAEMON_STATE=running
+  else
+    DAEMON_STATE=unresponsive
+  fi
+}
+
+remove_inactive_pidfile() {
+  probe_daemon
+  INACTIVE_PID_STATE=$DAEMON_STATE
+  case "$INACTIVE_PID_STATE" in
+    stale-pidfile|foreign-pid) ;;
+    *) die 'Docker pidfile is not proved inactive' ;;
+  esac
+  STALE_PID=$DAEMON_PID
+  read_pidfile && [ "$READ_PID" = "$STALE_PID" ] || die 'Docker pidfile changed during inactive recovery'
+  if [ "$INACTIVE_PID_STATE" = stale-pidfile ]; then
+    [ ! -d "$PROC_ROOT/$STALE_PID" ] || die 'Docker pid was reused during inactive recovery'
+  else
+    [ -d "$PROC_ROOT/$STALE_PID" ] && ! exact_daemon_pid "$STALE_PID" \
+      || die 'foreign Docker pid changed during inactive recovery'
+  fi
+  scan_exact_processes "$EXPECTED_DOCKERD" "$DOCKERD"
+  [ "$SCAN_COUNT" -eq 0 ] || die 'a Docker daemon appeared during stale recovery'
+  [ "$SCAN_FOREIGN_EXE_COUNT" -eq 0 ] \
+    || die 'a Docker process with an unexpected executable appeared during stale recovery'
+  [ "$SCAN_ARGV0_MISMATCH_COUNT" -eq 0 ] \
+    || die 'a Docker process with an unexpected argv0 appeared during stale recovery'
+  scan_exact_processes "$EXPECTED_CONTAINERD" "$CONTAINERD" containerd
+  [ "$SCAN_COUNT" -eq 0 ] || die 'containerd appeared during stale recovery'
+  [ "$SCAN_FOREIGN_EXE_COUNT" -eq 0 ] \
+    || die 'a containerd process with an unexpected executable appeared during stale recovery'
+  [ "$SCAN_ARGV0_MISMATCH_COUNT" -eq 0 ] \
+    || die 'a containerd process with an unexpected argv0 appeared during stale recovery'
+  ! docker_info && ! socket_present || die 'Docker endpoint appeared during stale recovery'
+  rm -f "$DOCKER_PIDFILE" || die 'cannot remove proved-stale Docker pidfile'
+  probe_daemon
+  [ "$DAEMON_STATE" = stopped ] || die 'Docker state changed during stale recovery'
+}
+
+probe_inventory() {
+  INVENTORY_COUNT=unknown
+  INVENTORY_RAW=$("$EXPECTED_DOCKER" ps -q 2>/dev/null) || return 1
+  INVENTORY_COUNT=0
+  while IFS= read -r INVENTORY_ID; do
+    [ -n "$INVENTORY_ID" ] || continue
+    case "$INVENTORY_ID" in
+      *[!0-9a-f]*) INVENTORY_COUNT=unknown; return 1 ;;
+    esac
+    [ "${#INVENTORY_ID}" -ge 12 ] && [ "${#INVENTORY_ID}" -le 64 ] || {
+      INVENTORY_COUNT=unknown
+      return 1
+    }
+    INVENTORY_COUNT=$((INVENTORY_COUNT + 1))
+  done <<EOF
+$INVENTORY_RAW
+EOF
+  return 0
+}
+
+valid_workload_profile_id() {
+  case "$1" in
+    [abcdefghijklmnopqrstuvwxyz0123456789]*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 64 ]
+}
+
+probe_workload_profile() {
+  WORKLOAD_PROFILE_STATE=none
+  WORKLOAD_PROFILE_ID=
+  WORKLOAD_PROFILE_DIR=
+  WORKLOAD_PROFILE_HOOK=
+  if [ ! -e "$WORKLOAD_PROFILE_FILE" ] && [ ! -L "$WORKLOAD_PROFILE_FILE" ]; then
+    return 0
+  fi
+  WORKLOAD_PROFILE_STATE=invalid
+  [ -d "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR" ] &&
+    [ "$("$STAT" -c '%u:%g' "$CONFIG_DIR" 2>/dev/null || true)" = "$EXPECTED_ROOT_OWNER" ] &&
+    [ "$("$STAT" -c '%a' "$CONFIG_DIR" 2>/dev/null || true)" = 700 ] \
+    || return 1
+  [ -f "$WORKLOAD_PROFILE_FILE" ] && [ ! -L "$WORKLOAD_PROFILE_FILE" ] &&
+    [ "$("$STAT" -c '%u:%g' "$WORKLOAD_PROFILE_FILE" 2>/dev/null || true)" = "$EXPECTED_ROOT_OWNER" ] &&
+    [ "$("$STAT" -c '%a' "$WORKLOAD_PROFILE_FILE" 2>/dev/null || true)" = 600 ] \
+    || return 1
+  WORKLOAD_PROFILE_PARSED=$("$SYSTEM_BIN/awk" -F= '
+    NR == 1 && $0 == "WORKLOAD_PROFILE_VERSION=1" { version = 1; next }
+    NR == 2 && $1 == "PROFILE_ID" && NF == 2 && length($2) >= 1 &&
+      length($2) <= 64 && substr($2, 1, 1) ~ /^[abcdefghijklmnopqrstuvwxyz0123456789]$/ &&
+      $2 !~ /[^abcdefghijklmnopqrstuvwxyz0123456789._-]/ { id = $2; next }
+    NR == 3 && $1 == "HOOK_SIZE" && NF == 2 && substr($2, 1, 1) ~ /^[123456789]$/ &&
+      $2 !~ /[^0123456789]/ { size = $2; next }
+    NR == 4 && $1 == "HOOK_SHA256" && NF == 2 && length($2) == 64 &&
+      $2 !~ /[^0123456789abcdef]/ { hash = $2; next }
+    { bad = 1 }
+    END {
+      if (bad || NR != 4 || !version || id == "" || size == "" || hash == "") exit 1
+      printf "%s|%s|%s\n", id, size, hash
+    }
+  ' "$WORKLOAD_PROFILE_FILE" 2>/dev/null) || return 1
+  OLD_IFS=$IFS
+  IFS='|'
+  read -r WORKLOAD_PROFILE_ID WORKLOAD_PROFILE_SIZE WORKLOAD_PROFILE_HASH <<EOF
+$WORKLOAD_PROFILE_PARSED
+EOF
+  IFS=$OLD_IFS
+  valid_workload_profile_id "$WORKLOAD_PROFILE_ID" || return 1
+  case "$WORKLOAD_PROFILE_SIZE" in
+    ''|0|0*|*[!0123456789]*) return 1 ;;
+  esac
+  [ "${#WORKLOAD_PROFILE_HASH}" -eq 64 ] || return 1
+  case "$WORKLOAD_PROFILE_HASH" in
+    *[!0123456789abcdef]*) return 1 ;;
+  esac
+  WORKLOAD_PROFILE_DESCRIPTOR_SIZE=$("$STAT" -c '%s' "$WORKLOAD_PROFILE_FILE" 2>/dev/null) \
+    || return 1
+  # The four validated ASCII records have 127 fixed bytes, including their
+  # four LF terminators, plus the variable profile ID and size digits.
+  WORKLOAD_PROFILE_CANONICAL_SIZE=$((127 + ${#WORKLOAD_PROFILE_ID} + ${#WORKLOAD_PROFILE_SIZE}))
+  [ "$WORKLOAD_PROFILE_DESCRIPTOR_SIZE" = "$WORKLOAD_PROFILE_CANONICAL_SIZE" ] || return 1
+  [ -d "$WORKLOAD_PROFILES_ROOT" ] && [ ! -L "$WORKLOAD_PROFILES_ROOT" ] &&
+    [ "$("$STAT" -c '%u:%g' "$WORKLOAD_PROFILES_ROOT" 2>/dev/null || true)" = "$EXPECTED_ROOT_OWNER" ] &&
+    [ "$("$STAT" -c '%a' "$WORKLOAD_PROFILES_ROOT" 2>/dev/null || true)" = 700 ] \
+    || return 1
+  WORKLOAD_PROFILE_DIR=$WORKLOAD_PROFILES_ROOT/$WORKLOAD_PROFILE_ID
+  WORKLOAD_PROFILE_HOOK=$WORKLOAD_PROFILE_DIR/hook
+  [ -d "$WORKLOAD_PROFILE_DIR" ] && [ ! -L "$WORKLOAD_PROFILE_DIR" ] &&
+    [ "$("$STAT" -c '%u:%g' "$WORKLOAD_PROFILE_DIR" 2>/dev/null || true)" = "$EXPECTED_ROOT_OWNER" ] &&
+    [ "$("$STAT" -c '%a' "$WORKLOAD_PROFILE_DIR" 2>/dev/null || true)" = 700 ] \
+    || return 1
+  [ "$(LC_ALL=C ls -A "$WORKLOAD_PROFILE_DIR" 2>/dev/null || true)" = hook ] || return 1
+  [ -f "$WORKLOAD_PROFILE_HOOK" ] && [ ! -L "$WORKLOAD_PROFILE_HOOK" ] &&
+    [ "$("$STAT" -c '%u:%g' "$WORKLOAD_PROFILE_HOOK" 2>/dev/null || true)" = "$EXPECTED_ROOT_OWNER" ] &&
+    [ "$("$STAT" -c '%a' "$WORKLOAD_PROFILE_HOOK" 2>/dev/null || true)" = 700 ] &&
+    [ "$("$STAT" -c '%s' "$WORKLOAD_PROFILE_HOOK" 2>/dev/null || true)" = "$WORKLOAD_PROFILE_SIZE" ] \
+    || return 1
+  [ -x "$SHA256SUM" ] && [ -x "$ENV" ] || return 1
+  WORKLOAD_PROFILE_ACTUAL_HASH=$("$SHA256SUM" "$WORKLOAD_PROFILE_HOOK" 2>/dev/null |
+    "$SYSTEM_BIN/awk" '
+      NR == 1 && length($1) == 64 && $1 !~ /[^0123456789abcdef]/ { hash = $1; next }
+      { bad = 1 }
+      END { if (bad || NR != 1 || hash == "") exit 1; print hash }
+    ') || return 1
+  [ "$WORKLOAD_PROFILE_ACTUAL_HASH" = "$WORKLOAD_PROFILE_HASH" ] || return 1
+  WORKLOAD_PROFILE_STATE=ready
+  return 0
+}
+
+require_workload_profile() {
+  probe_workload_profile \
+    || die 'configured workload profile is malformed, tampered, or unsafe'
+}
+
+probe_owned_lifecycle_lock() {
+  [ "$LOCK_OWNED" = 1 ] || return 1
+  [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ] || return 1
+  [ "$(LC_ALL=C ls -A "$LOCK_DIR" 2>/dev/null || true)" = pid ] || return 1
+  CURRENT_LOCK_DIR_IDENTITY=$("$STAT" -c '%d:%i:%u:%g:%a' "$LOCK_DIR" 2>/dev/null) \
+    || return 1
+  case "$CURRENT_LOCK_DIR_IDENTITY" in
+    *:*:"$EXPECTED_ROOT_OWNER":700) ;;
+    *) return 1 ;;
+  esac
+  [ -f "$LOCK_OWNER" ] && [ ! -L "$LOCK_OWNER" ] || return 1
+  CURRENT_LOCK_OWNER_IDENTITY=$("$STAT" -c '%d:%i:%u:%g:%a:%h:%s' "$LOCK_OWNER" 2>/dev/null) \
+    || return 1
+  LOCK_SELF_PID=$$
+  EXPECTED_LOCK_OWNER_SIZE=$((${#LOCK_SELF_PID} + 1))
+  case "$CURRENT_LOCK_OWNER_IDENTITY" in
+    *:*:"$EXPECTED_ROOT_OWNER":600:1:"$EXPECTED_LOCK_OWNER_SIZE") ;;
+    *) return 1 ;;
+  esac
+  [ "$(cat "$LOCK_OWNER" 2>/dev/null || true)" = "$$" ]
+}
+
+capture_workload_lifecycle_lock() {
+  probe_owned_lifecycle_lock \
+    || die 'lifecycle lock is not physically owned before the workload hook'
+  WORKLOAD_LOCK_DIR_IDENTITY=$CURRENT_LOCK_DIR_IDENTITY
+  WORKLOAD_LOCK_OWNER_IDENTITY=$CURRENT_LOCK_OWNER_IDENTITY
+}
+
+reprove_workload_lifecycle_lock() {
+  probe_owned_lifecycle_lock \
+    || die 'lifecycle lock ownership changed during the workload hook'
+  [ "$CURRENT_LOCK_DIR_IDENTITY" = "$WORKLOAD_LOCK_DIR_IDENTITY" ] &&
+    [ "$CURRENT_LOCK_OWNER_IDENTITY" = "$WORKLOAD_LOCK_OWNER_IDENTITY" ] \
+    || die 'lifecycle lock identity changed during the workload hook'
+}
+
+run_workload_profile_hook() {
+  WORKLOAD_PROFILE_PHASE=$1
+  [ "$LOCK_OWNED" = 1 ] || die 'internal workload profile invocation is outside the lifecycle lock'
+  case "$WORKLOAD_PROFILE_PHASE" in
+    post-start|pre-stop) ;;
+    *) die 'internal workload profile phase is invalid' ;;
+  esac
+  require_workload_profile
+  [ "$WORKLOAD_PROFILE_STATE" = ready ] || return 0
+  capture_workload_lifecycle_lock
+  "$KSU_BUSYBOX" timeout -k "$WORKLOAD_HOOK_KILL_GRACE_SECONDS" \
+    "$WORKLOAD_HOOK_TIMEOUT_SECONDS" \
+    "$ENV" -i PATH="$PATH" DOCKER_HOST="$DOCKER_HOST" \
+    WORKLOAD_PROFILE_ID="$WORKLOAD_PROFILE_ID" \
+    "$WORKLOAD_PROFILE_HOOK" "$WORKLOAD_PROFILE_PHASE" </dev/null 1>&2
+  WORKLOAD_PROFILE_STATUS=$?
+  reprove_workload_lifecycle_lock
+  [ "$WORKLOAD_PROFILE_STATUS" -eq 0 ] \
+    || die "workload profile $WORKLOAD_PROFILE_ID $WORKLOAD_PROFILE_PHASE hook failed (status=$WORKLOAD_PROFILE_STATUS)"
+}
+
+reprove_daemon_after_workload_hook() {
+  REPROVE_WORKLOAD_PID=$1
+  REPROVE_WORKLOAD_PHASE=$2
+  probe_daemon
+  [ "$DAEMON_STATE" = running ] && [ "$DAEMON_PID" = "$REPROVE_WORKLOAD_PID" ] &&
+    exact_daemon_pid "$REPROVE_WORKLOAD_PID" \
+    || die "Docker daemon identity changed during the workload $REPROVE_WORKLOAD_PHASE hook; no signal was sent"
+}
+
+validate_disk_size() {
+  VALIDATE_SIZE=$1
+  case "$VALIDATE_SIZE" in
+    0) return 0 ;;
+    ''|0*|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#VALIDATE_SIZE}" -le 13 ] || return 1
+  "$SYSTEM_BIN/awk" \
+    -v size="$VALIDATE_SIZE" \
+    -v minimum="$DISK_MIN_BYTES" \
+    -v maximum="$DISK_MAX_BYTES" '
+      BEGIN {
+        exit !(size >= minimum && size <= maximum && (size % 4096) == 0)
+      }
+    ' </dev/null
+}
+
+validate_bridge_pool_cidr() {
+  "$SYSTEM_BIN/awk" -v cidr="$1" '
+    BEGIN {
+      if (split(cidr, pair, "/") != 2 || pair[2] == "" || pair[2] ~ /[^0-9]/) exit 1
+      prefix = pair[2] + 0
+      if (pair[2] != prefix "" || prefix < 12 || prefix > 24) exit 1
+      if (split(pair[1], octet, ".") != 4) exit 1
+      value = 0
+      for (i = 1; i <= 4; i++) {
+        if (octet[i] == "" || octet[i] ~ /[^0-9]/ ||
+            (length(octet[i]) > 1 && substr(octet[i], 1, 1) == "0") || octet[i] > 255) exit 1
+        value = value * 256 + octet[i]
+      }
+      block = 2 ^ (32 - prefix)
+      if (value % block != 0) exit 1
+      end = value + block - 1
+      private = ((value >= 167772160 && end <= 184549375) ||
+                 (value >= 2886729728 && end <= 2887778303) ||
+                 (value >= 3232235520 && end <= 3232301055))
+      if (!private) exit 1
+    }
+  ' </dev/null
+}
+
+read_host_config() {
+  HOST_CONFIG_STATE=missing
+  AUTOSTART_STATE=off
+  DISK_SIZE_BYTES=0
+  BRIDGE_POOL_CIDR=$DEFAULT_BRIDGE_POOL_CIDR
+  EXT4_FEATURES=$EXPECTED_EXT4_FEATURES
+  MOUNT_OPTIONS=$EXPECTED_MOUNT_OPTIONS
+  if [ ! -e "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ]; then
+    return 0
+  fi
+  [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] \
+    || { HOST_CONFIG_STATE=invalid; AUTOSTART_STATE=unknown; return 1; }
+  CONFIG_PARSED=$("$SYSTEM_BIN/awk" -F= '
+    NR == 1 {
+      if ($0 == "HOST_CONFIG_VERSION=1") schema = 1
+      else if ($0 == "HOST_CONFIG_VERSION=2") schema = 2
+      else bad = 1
+      next
+    }
+    NR == 2 && ($0 == "AUTOSTART=0" || $0 == "AUTOSTART=1") {
+      autostart = substr($0, 11); next
+    }
+    NR == 3 && schema == 2 && $1 == "DISK_SIZE_BYTES" && NF == 2 { size = $2; next }
+    NR == 4 && schema == 2 && $1 == "BRIDGE_POOL_CIDR" && NF == 2 { cidr = $2; next }
+    NR == 5 && schema == 2 && ($0 == "EXT4_FEATURES=^casefold" || $0 == "EXT4_FEATURES=^has_journal,^casefold") { features = substr($0, 15); next }
+    NR == 6 && schema == 2 && $0 == "MOUNT_OPTIONS=noatime,nodev" { options = substr($0, 15); next }
+    { bad = 1 }
+    END {
+      if (bad || autostart == "") exit 1
+      if (schema == 1 && NR == 2) printf "legacy|%s|0|172.17.0.0/16|^has_journal,^casefold|noatime,nodev\n", autostart
+      else if (schema == 2 && NR == 6 && size != "" && cidr != "" && features != "" && options != "")
+        printf "v2|%s|%s|%s|%s|%s\n", autostart, size, cidr, features, options
+      else exit 1
+    }
+  ' "$CONFIG_FILE" 2>/dev/null) \
+    || { HOST_CONFIG_STATE=invalid; AUTOSTART_STATE=unknown; return 1; }
+  OLD_IFS=$IFS
+  IFS='|'
+  read -r CONFIG_KIND CONFIG_AUTOSTART DISK_SIZE_BYTES BRIDGE_POOL_CIDR EXT4_FEATURES MOUNT_OPTIONS <<EOF
+$CONFIG_PARSED
+EOF
+  IFS=$OLD_IFS
+  case "$CONFIG_AUTOSTART" in
+    0) AUTOSTART_STATE=off ;;
+    1) AUTOSTART_STATE=on ;;
+    *) HOST_CONFIG_STATE=invalid; AUTOSTART_STATE=unknown; return 1 ;;
+  esac
+  if [ "$CONFIG_KIND" = legacy ]; then
+    HOST_CONFIG_STATE=legacy
+    return 0
+  fi
+  validate_disk_size "$DISK_SIZE_BYTES" &&
+    validate_bridge_pool_cidr "$BRIDGE_POOL_CIDR" &&
+    { [ "$EXT4_FEATURES" = "$EXPECTED_EXT4_FEATURES" ] || [ "$EXT4_FEATURES" = "$COMPAT_EXT4_FEATURES" ]; } &&
+    [ "$MOUNT_OPTIONS" = "$EXPECTED_MOUNT_OPTIONS" ] \
+    || { HOST_CONFIG_STATE=invalid; AUTOSTART_STATE=unknown; return 1; }
+  if [ "$DISK_SIZE_BYTES" = 0 ]; then
+    HOST_CONFIG_STATE=unconfigured
+  else
+    HOST_CONFIG_STATE=ready
+  fi
+  return 0
+}
+
+read_autostart() {
+  read_host_config
+}
+
+prepare_config_directory() {
+  if [ ! -e "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR" ]; then
+    mkdir "$CONFIG_DIR" || die 'cannot create host config directory'
+    chmod 0700 "$CONFIG_DIR" || die 'cannot protect host config directory'
+  fi
+  [ -d "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR" ] || die 'host config directory is unsafe'
+}
+
+publish_config() {
+  PUBLISH_AUTOSTART=$1
+  PUBLISH_SIZE=$2
+  PUBLISH_CIDR=$3
+  prepare_config_directory
+  CONFIG_TEMP=$CONFIG_FILE.tmp.$$
+  [ ! -e "$CONFIG_TEMP" ] && [ ! -L "$CONFIG_TEMP" ] || die 'host config temporary path already exists'
+  (umask 077; printf 'HOST_CONFIG_VERSION=2\nAUTOSTART=%s\nDISK_SIZE_BYTES=%s\nBRIDGE_POOL_CIDR=%s\nEXT4_FEATURES=%s\nMOUNT_OPTIONS=%s\n' \
+    "$PUBLISH_AUTOSTART" "$PUBLISH_SIZE" "$PUBLISH_CIDR" \
+    "$EXPECTED_EXT4_FEATURES" "$EXPECTED_MOUNT_OPTIONS" > "$CONFIG_TEMP") \
+    || die 'cannot write host config temporary file'
+  chmod 0600 "$CONFIG_TEMP" || die 'cannot protect host config temporary file'
+  mv -f "$CONFIG_TEMP" "$CONFIG_FILE" || die 'cannot atomically publish host config'
+  CONFIG_TEMP=
+}
+
+write_autostart() {
+  WRITE_VALUE=$1
+  read_host_config || die 'existing host config is malformed or unsafe; refusing replacement'
+  if [ "$HOST_CONFIG_STATE" = missing ] || [ "$HOST_CONFIG_STATE" = legacy ]; then
+    prepare_config_directory
+    CONFIG_TEMP=$CONFIG_FILE.tmp.$$
+    [ ! -e "$CONFIG_TEMP" ] && [ ! -L "$CONFIG_TEMP" ] || die 'host config temporary path already exists'
+    (umask 077; printf 'HOST_CONFIG_VERSION=1\nAUTOSTART=%s\n' "$WRITE_VALUE" > "$CONFIG_TEMP") \
+      || die 'cannot write host config temporary file'
+    chmod 0600 "$CONFIG_TEMP" || die 'cannot protect host config temporary file'
+    mv -f "$CONFIG_TEMP" "$CONFIG_FILE" || die 'cannot atomically publish host config'
+    CONFIG_TEMP=
+    return 0
+  fi
+  publish_config "$WRITE_VALUE" "$DISK_SIZE_BYTES" "$BRIDGE_POOL_CIDR"
+}
+
+validate_existing_autostart() {
+  if [ ! -e "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ]; then
+    return 0
+  fi
+  read_host_config || die 'existing host config is malformed or unsafe; refusing replacement'
+}
+
+resolve_disk_loops() {
+  DISK_LOOP_STATE=none
+  DISK_LOOP=
+  [ -x "$LOSETUP" ] || { DISK_LOOP_STATE=unknown; return 1; }
+  LOOP_ROWS=$("$LOSETUP" -j "$DOCKER_DISK" 2>/dev/null) \
+    || { DISK_LOOP_STATE=unknown; return 1; }
+  [ -n "$LOOP_ROWS" ] || return 0
+  LOOP_PARSED=$(printf '%s\n' "$LOOP_ROWS" | "$SYSTEM_BIN/awk" -v disk="$DOCKER_DISK" '
+    BEGIN { count = 0; bad = 0 }
+    {
+      colon = index($0, ":")
+      suffix = " (" disk ")"
+      device = substr($0, 1, colon - 1)
+      if (colon < 2 || substr($0, length($0) - length(suffix) + 1) != suffix ||
+          device !~ /^\/dev\/(block\/)?loop[0-9]+$/) bad = 1
+      else { count++; selected = device }
+    }
+    END {
+      if (bad) exit 1
+      printf "%d|%s\n", count, selected
+    }
+  ') || { DISK_LOOP_STATE=unknown; return 1; }
+  OLD_IFS=$IFS
+  IFS='|'
+  read -r LOOP_COUNT DISK_LOOP <<EOF
+$LOOP_PARSED
+EOF
+  IFS=$OLD_IFS
+  case "$LOOP_COUNT" in
+    1) DISK_LOOP_STATE=ready; return 0 ;;
+    0) DISK_LOOP_STATE=none; DISK_LOOP=; return 0 ;;
+    *) DISK_LOOP_STATE=multiple; return 1 ;;
+  esac
+}
+
+probe_mount() {
+  MOUNT_STATE=unmounted
+  MOUNT_SOURCE=
+  [ -r "$MOUNTS" ] || { MOUNT_STATE=unknown; return 1; }
+  MOUNT_PARSED=$("$SYSTEM_BIN/awk" -v target="$DOCKER_DATA" '
+    $2 == target { count++; source = $1; type = $3; options = $4 }
+    END {
+      if (count > 1) exit 2
+      if (count == 1) printf "%s|%s|%s\n", source, type, options
+    }
+  ' "$MOUNTS" 2>/dev/null)
+  MOUNT_RESULT=$?
+  [ "$MOUNT_RESULT" -eq 0 ] || { MOUNT_STATE=ambiguous; return 1; }
+  [ -n "$MOUNT_PARSED" ] || return 0
+  OLD_IFS=$IFS
+  IFS='|'
+  read -r MOUNT_SOURCE MOUNT_TYPE MOUNT_FLAGS <<EOF
+$MOUNT_PARSED
+EOF
+  IFS=$OLD_IFS
+  [ "$MOUNT_TYPE" = ext4 ] || { MOUNT_STATE=wrong-filesystem; return 1; }
+  case ",$MOUNT_FLAGS," in *,noatime,*) ;; *) MOUNT_STATE=wrong-options; return 1 ;; esac
+  case ",$MOUNT_FLAGS," in *,nodev,*) ;; *) MOUNT_STATE=wrong-options; return 1 ;; esac
+  resolve_disk_loops || { MOUNT_STATE=wrong-source; return 1; }
+  [ "$DISK_LOOP_STATE" = ready ] && [ "$MOUNT_SOURCE" = "$DISK_LOOP" ] \
+    || { MOUNT_STATE=wrong-source; return 1; }
+  MOUNT_STATE=ready
+  return 0
+}
+
+probe_disk() {
+  DISK_STATE=absent
+  DISK_ACTUAL_SIZE=0
+  if [ ! -e "$DOCKER_DISK" ] && [ ! -L "$DOCKER_DISK" ]; then
+    return 0
+  fi
+  [ -f "$DOCKER_DISK" ] && [ ! -L "$DOCKER_DISK" ] \
+    || { DISK_STATE=unsafe; return 1; }
+  DISK_ACTUAL_SIZE=$("$STAT" -c %s "$DOCKER_DISK" 2>/dev/null) \
+    || { DISK_STATE=unknown; return 1; }
+  case "$DISK_ACTUAL_SIZE" in ''|*[!0-9]*) DISK_STATE=unknown; return 1 ;; esac
+  if [ "$HOST_CONFIG_STATE" != ready ]; then
+    DISK_STATE=unconfigured
+    return 1
+  fi
+  [ "$DISK_ACTUAL_SIZE" = "$DISK_SIZE_BYTES" ] \
+    || { DISK_STATE=size-mismatch; return 1; }
+  probe_mount || true
+  case "$MOUNT_STATE" in
+    ready) DISK_STATE=ready; return 0 ;;
+    unmounted) ;;
+    *) DISK_STATE=mount-conflict; return 1 ;;
+  esac
+  [ -x "$E2FSCK" ] || { DISK_STATE=unknown; return 1; }
+  if "$E2FSCK" -fn "$DOCKER_DISK" >/dev/null 2>&1; then
+    DISK_STATE=ready
+    return 0
+  fi
+  DISK_STATE=dirty
+  return 1
+}
+
+probe_storage() {
+  probe_mount || true
+  probe_disk || true
+}
+
+require_runtime_config() {
+  read_host_config || die 'host config is malformed or unsafe'
+  case "$HOST_CONFIG_STATE" in
+    ready) return 0 ;;
+    missing|legacy|unconfigured)
+      die 'Docker disk size is unconfigured; run: /data/docker/bin/hostctl disk-init --size-bytes BYTES'
+      ;;
+    *) die 'host config is malformed or unsafe' ;;
+  esac
+}
+
+check_disk_free_space() {
+  [ -x "$DF" ] || die 'disk free-space checker is unavailable'
+  AVAILABLE_KIB=$("$DF" -k "$DOCKER_ROOT" 2>/dev/null | "$SYSTEM_BIN/awk" '
+    NR > 1 && $4 ~ /^[0-9]+$/ { available = $4 }
+    END { if (available == "") exit 1; print available }
+  ') || die 'cannot determine free space for Docker disk initialization'
+  case "$AVAILABLE_KIB" in ''|*[!0-9]*) die 'cannot determine free space for Docker disk initialization' ;; esac
+  [ "${#AVAILABLE_KIB}" -le 16 ] || die 'reported free space is outside the supported range'
+  REQUIRED_BYTES=$("$SYSTEM_BIN/awk" \
+    -v size="$DISK_SIZE_BYTES" \
+    -v margin="$DISK_FREE_MARGIN_BYTES" \
+    'BEGIN { printf "%.0f\n", size + margin }' </dev/null) \
+    || die 'cannot calculate required free space for Docker disk initialization'
+  "$SYSTEM_BIN/awk" \
+    -v available_kib="$AVAILABLE_KIB" \
+    -v required="$REQUIRED_BYTES" \
+    'BEGIN { exit !((available_kib * 1024) >= required) }' </dev/null \
+    || die "insufficient free space: need $REQUIRED_BYTES bytes including safety margin"
+}
+
+create_disk_image() {
+  [ "$DISK_SIZE_BYTES" != 0 ] || die 'Docker disk size is unconfigured'
+  [ ! -e "$DOCKER_DISK" ] && [ ! -L "$DOCKER_DISK" ] \
+    || die 'Docker disk path appeared before initialization; refusing replacement'
+  for DISK_TOOL in "$TRUNCATE" "$MKE2FS" "$E2FSCK" "$STAT" "$LN" "$SYNC"; do
+    [ -x "$DISK_TOOL" ] || die "required disk tool is unavailable: $DISK_TOOL"
+  done
+  check_disk_free_space
+  DISK_TEMP=$DOCKER_ROOT/.disk.img.hostctl.$$
+  [ ! -e "$DISK_TEMP" ] && [ ! -L "$DISK_TEMP" ] \
+    || die 'Docker disk temporary path already exists'
+  (umask 077; set -C; : > "$DISK_TEMP") 2>/dev/null \
+    || die 'cannot create Docker disk temporary file'
+  "$TRUNCATE" -s "$DISK_SIZE_BYTES" "$DISK_TEMP" \
+    || die 'cannot allocate sparse Docker disk image'
+  TEMP_SIZE=$("$STAT" -c %s "$DISK_TEMP" 2>/dev/null) \
+    || die 'cannot verify sparse Docker disk size'
+  [ "$TEMP_SIZE" = "$DISK_SIZE_BYTES" ] || die 'sparse Docker disk has an unexpected size'
+  "$MKE2FS" -q -t ext4 -O "$EXT4_FEATURES" "$DISK_TEMP" \
+    || die 'cannot create the configured ext4 filesystem'
+  "$E2FSCK" -fn "$DISK_TEMP" >/dev/null 2>&1 \
+    || die 'new Docker ext4 filesystem failed its read-only consistency check'
+  "$SYNC" || die 'cannot sync the prepared Docker disk image'
+  [ ! -e "$DOCKER_DISK" ] && [ ! -L "$DOCKER_DISK" ] \
+    || die 'Docker disk path appeared during initialization; refusing replacement'
+  "$LN" "$DISK_TEMP" "$DOCKER_DISK" \
+    || die 'cannot publish Docker disk without replacing existing data'
+  "$CHCON" u:object_r:vold_data_file:s0 "$DOCKER_DISK" \
+    || die 'cannot assign the Android data-file label to the Docker disk'
+  [ "$DISK_TEMP" -ef "$DOCKER_DISK" ] \
+    || die 'published Docker disk identity could not be verified'
+  "$SYNC" || die 'cannot sync the published Docker disk image'
+  rm -f "$DISK_TEMP" || die 'cannot remove published Docker disk temporary link'
+  DISK_TEMP=
+  probe_disk
+  [ "$DISK_STATE" = ready ] || die "new Docker disk failed verification (state=$DISK_STATE)"
+}
+
+ensure_disk_image() {
+  probe_storage
+  case "$DISK_STATE" in
+    ready) return 0 ;;
+    absent) create_disk_image; return 0 ;;
+    dirty)
+      die 'Docker disk is dirty or inconsistent; with Docker stopped run: /system/bin/e2fsck -f /data/docker/disk.img'
+      ;;
+    size-mismatch) die 'Docker disk size does not match the explicit host configuration; refusing replacement' ;;
+    unsafe|unconfigured|unknown) die "Docker disk is unavailable or unsafe (state=$DISK_STATE)" ;;
+    mount-conflict) die "Docker data mount is unsafe (state=$MOUNT_STATE); refusing unmount or replacement" ;;
+    *) die "Docker disk state is unknown ($DISK_STATE)" ;;
+  esac
+}
+
+ensure_data_mountpoint() {
+  if [ ! -e "$DOCKER_DATA" ] && [ ! -L "$DOCKER_DATA" ]; then
+    mkdir "$DOCKER_DATA" || die 'cannot create Docker data mountpoint'
+    chmod 0700 "$DOCKER_DATA" || die 'cannot protect Docker data mountpoint'
+  fi
+  [ -d "$DOCKER_DATA" ] && [ ! -L "$DOCKER_DATA" ] \
+    || die 'Docker data mountpoint is unsafe'
+  [ -z "$(LC_ALL=C ls -A "$DOCKER_DATA" 2>/dev/null)" ] \
+    || die 'unmounted Docker data directory is not empty; refusing to hide its contents'
+}
+
+ensure_data_mount() {
+  probe_mount || true
+  case "$MOUNT_STATE" in
+    ready) return 0 ;;
+    unmounted) ;;
+    *) die "Docker data mount is unsafe (state=$MOUNT_STATE); refusing unmount or remount" ;;
+  esac
+  ensure_data_mountpoint
+  [ -x "$CHCON" ] || die 'Android file-label tool is unavailable'
+  "$CHCON" u:object_r:vold_data_file:s0 "$DOCKER_DISK" \
+    || die 'cannot assign the Android data-file label to the Docker disk'
+  resolve_disk_loops || true
+  case "$DISK_LOOP_STATE" in
+    ready) ;;
+    none)
+      DISK_LOOP=$("$LOSETUP" -f --show "$DOCKER_DISK" 2>/dev/null) \
+        || die 'cannot allocate a loop device for the Docker disk'
+      LOOP_SUFFIX=${DISK_LOOP#/dev/loop}
+      if [ "$LOOP_SUFFIX" = "$DISK_LOOP" ]; then
+        LOOP_SUFFIX=${DISK_LOOP#/dev/block/loop}
+      fi
+      case "$LOOP_SUFFIX" in ''|*[!0-9]*) die 'loop allocator returned an unsafe device path' ;; esac
+      CREATED_LOOP=$DISK_LOOP
+      resolve_disk_loops \
+        || die 'new Docker disk loop association could not be verified'
+      [ "$DISK_LOOP_STATE" = ready ] && [ "$DISK_LOOP" = "$CREATED_LOOP" ] \
+        || die 'new Docker disk loop association is ambiguous'
+      ;;
+    multiple) die 'Docker disk has multiple loop associations; refusing mount' ;;
+    *) die 'Docker disk loop association is unknown' ;;
+  esac
+  LOOP_OTHER_MOUNT=$("$SYSTEM_BIN/awk" -v source="$DISK_LOOP" -v target="$DOCKER_DATA" \
+    '$1 == source && $2 != target { print $2; exit }' "$MOUNTS" 2>/dev/null) \
+    || die 'cannot inspect existing loop mount use'
+  [ -z "$LOOP_OTHER_MOUNT" ] \
+    || die "Docker disk loop is already mounted elsewhere: $LOOP_OTHER_MOUNT"
+  if ! "$MOUNT" -t ext4 -o "$MOUNT_OPTIONS" "$DISK_LOOP" "$DOCKER_DATA"; then
+    probe_mount || true
+    if [ "$MOUNT_STATE" = unmounted ] && [ -n "$CREATED_LOOP" ]; then
+      "$LOSETUP" -d "$CREATED_LOOP" 2>/dev/null || true
+    fi
+    CREATED_LOOP=
+    die 'cannot mount the Docker ext4 data image; no existing mount was changed'
+  fi
+  CREATED_LOOP=
+  probe_mount || die "Docker data mount failed verification (state=$MOUNT_STATE)"
+  [ "$MOUNT_STATE" = ready ] || die "Docker data mount failed verification (state=$MOUNT_STATE)"
+}
+
+find_bridge_route_overlap() {
+  CURRENT_IPV4_ROUTES=$("$IP" -4 route show table all 2>/dev/null) || return 2
+  printf '%s\n' "$CURRENT_IPV4_ROUTES" | "$SYSTEM_BIN/awk" -v target="$BRIDGE_POOL_CIDR" '
+    function ipv4(ip, part, count, i, value) {
+      count = split(ip, part, ".")
+      if (count != 4) return -1
+      value = 0
+      for (i = 1; i <= 4; i++) {
+        if (part[i] == "" || part[i] ~ /[^0-9]/ || part[i] > 255) return -1
+        value = value * 256 + part[i]
+      }
+      return value
+    }
+    function bounds(cidr, output, pair, address, prefix, block) {
+      if (split(cidr, pair, "/") == 1) pair[2] = 32
+      address = ipv4(pair[1]); prefix = pair[2] + 0
+      if (address < 0 || prefix < 0 || prefix > 32) return ""
+      block = 2 ^ (32 - prefix)
+      return int(address / block) * block ":" (int(address / block) * block + block - 1)
+    }
+    BEGIN {
+      range = bounds(target); split(range, target_range, ":")
+      if (range == "") { invalid = 1; exit }
+    }
+    {
+      destination = $1; device = ""
+      if (destination == "local" || destination == "broadcast" || destination == "unreachable" ||
+          destination == "blackhole" || destination == "prohibit" || destination == "throw") destination = $2
+      if (destination == "default" || destination !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) next
+      for (i = 1; i <= NF; i++) {
+        if ($i == "dev" && i < NF) device = $(i + 1)
+      }
+      range = bounds(destination)
+      if (range == "") next
+      split(range, route_range, ":")
+      if (route_range[1] <= target_range[2] && target_range[1] <= route_range[2]) {
+        if ((device == "docker0" || device ~ /^br-[0-9a-f]+$/) &&
+            route_range[1] >= target_range[1] && route_range[2] <= target_range[2]) next
+        print $0
+        found = 1
+        exit
+      }
+    }
+    END { if (invalid) exit 2; if (found) exit 0; exit 1 }
+  '
+}
+
+probe_bridge_routes() {
+  BRIDGE_ROUTE_STATE=unconfigured
+  case "$HOST_CONFIG_STATE" in ready|unconfigured) ;; *) return 1 ;; esac
+  [ -x "$IP" ] || { BRIDGE_ROUTE_STATE=unknown; return 1; }
+  ROUTE_CONFLICT=$(find_bridge_route_overlap)
+  ROUTE_CONFLICT_STATUS=$?
+  case "$ROUTE_CONFLICT_STATUS" in
+    0) BRIDGE_ROUTE_STATE=conflict; return 1 ;;
+    1) BRIDGE_ROUTE_STATE=ready; return 0 ;;
+    *) BRIDGE_ROUTE_STATE=unknown; return 1 ;;
+  esac
+}
+
+require_no_bridge_overlap() {
+  probe_bridge_routes || true
+  case "$BRIDGE_ROUTE_STATE" in
+    ready) return 0 ;;
+    conflict) die "bridge pool $BRIDGE_POOL_CIDR overlaps a current non-Docker route: $ROUTE_CONFLICT" ;;
+    *) die 'cannot inspect current IPv4 routes for bridge-pool overlap' ;;
+  esac
+}
+
+probe_wifi_interface() {
+  WIFI_INTERFACE_STATE=unavailable
+  [ -x "$IP" ] || { WIFI_INTERFACE_STATE=unknown; return 1; }
+  "$IP" link show dev wlan0 >/dev/null 2>&1 || return 1
+  "$IP" -4 addr show dev wlan0 2>/dev/null | "$SYSTEM_BIN/awk" '
+    $1 == "inet" || $2 == "inet" { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' || { WIFI_INTERFACE_STATE=disconnected; return 1; }
+  "$IP" -4 route show table wlan0 2>/dev/null | "$SYSTEM_BIN/awk" '
+    $1 == "default" {
+      for (i = 1; i < NF; i++) if ($i == "dev" && $(i + 1) == "wlan0") found = 1
+    }
+    END { exit found ? 0 : 1 }
+  ' || { WIFI_INTERFACE_STATE=disconnected; return 1; }
+  WIFI_INTERFACE_STATE=ready
+  return 0
+}
+
+probe_wifi_policy() {
+  WIFI_POLICY_STATE=unconfigured
+  WIFI_TO_MAIN_STATE=unknown
+  WIFI_FROM_TABLE_STATE=unknown
+  case "$HOST_CONFIG_STATE" in ready|unconfigured) ;; *) return 1 ;; esac
+  [ -x "$IP" ] || { WIFI_POLICY_STATE=unknown; return 1; }
+  IP_RULES=$("$IP" -4 rule show 2>/dev/null) \
+    || { WIFI_POLICY_STATE=unknown; return 1; }
+  POLICY_PARSED=$(printf '%s\n' "$IP_RULES" | "$SYSTEM_BIN/awk" -v cidr="$BRIDGE_POOL_CIDR" '
+    {
+      preference = $1; sub(/:$/, "", preference)
+      if (preference != "9990" && preference != "9991") next
+      count[preference]++
+      exact = 0
+      if (preference == "9990" && NF == 7 && $2 == "from" && $3 == "all" &&
+          $4 == "to" && $5 == cidr && $6 == "lookup" && $7 == "main") exact = 1
+      if (preference == "9990" && NF == 5 && $2 == "to" && $3 == cidr &&
+          $4 == "lookup" && $5 == "main") exact = 1
+      if (preference == "9991" && NF == 5 && $2 == "from" && $3 == cidr &&
+          $4 == "lookup" && $5 == "wlan0") exact = 1
+      if (exact) matches[preference]++
+    }
+    END {
+      if (count[9990] == 0) to_state = "missing"
+      else if (count[9990] == 1 && matches[9990] == 1) to_state = "ready"
+      else to_state = "conflict"
+      if (count[9991] == 0) from_state = "missing"
+      else if (count[9991] == 1 && matches[9991] == 1) from_state = "ready"
+      else from_state = "conflict"
+      if (to_state == "conflict" || from_state == "conflict") state = "conflict"
+      else if (to_state == "missing" || from_state == "missing") state = "missing"
+      else state = "ready"
+      printf "%s|%s|%s\n", state, to_state, from_state
+    }
+  ') || { WIFI_POLICY_STATE=unknown; return 1; }
+  OLD_IFS=$IFS
+  IFS='|'
+  read -r WIFI_POLICY_STATE WIFI_TO_MAIN_STATE WIFI_FROM_TABLE_STATE <<EOF
+$POLICY_PARSED
+EOF
+  IFS=$OLD_IFS
+  case "$WIFI_POLICY_STATE:$WIFI_TO_MAIN_STATE:$WIFI_FROM_TABLE_STATE" in
+    ready:ready:ready|missing:missing:ready|missing:ready:missing|missing:missing:missing|conflict:conflict:*|conflict:*:conflict) ;;
+    *) WIFI_POLICY_STATE=unknown; WIFI_TO_MAIN_STATE=unknown; WIFI_FROM_TABLE_STATE=unknown ;;
+  esac
+  [ "$WIFI_POLICY_STATE" = ready ]
+}
+
+resolve_wifi_table_id() {
+  WIFI_TABLE_ID=
+  [ -f "$RT_TABLES" ] && [ ! -L "$RT_TABLES" ] && [ -r "$RT_TABLES" ] || return 1
+  WIFI_TABLE_ID=$("$SYSTEM_BIN/awk" '
+    NF == 0 { next }
+    {
+      if (NF != 2 || $1 !~ /^(0|[1-9][0-9]*)$/ || length($1) > 10 ||
+          ($1 + 0) > 4294967295 || $2 !~ /^[A-Za-z0-9_.-]+$/ || length($2) > 15) bad = 1
+      if (name_seen[$2]++ || id_seen[$1]++) bad = 1
+      if ($2 == "wlan0") { wlan_count++; wlan_id = $1 }
+    }
+    END {
+      if (bad || wlan_count != 1 || wlan_id + 0 < 256) exit 1
+      print wlan_id
+    }
+  ' "$RT_TABLES" 2>/dev/null) || return 1
+  case "$WIFI_TABLE_ID" in
+    ''|0|0[0-9]*|*[!0-9]*) WIFI_TABLE_ID=; return 1 ;;
+  esac
+  [ -f "$SYS_CLASS_NET/wlan0/ifindex" ] &&
+    [ ! -L "$SYS_CLASS_NET/wlan0/ifindex" ] || { WIFI_TABLE_ID=; return 1; }
+  WIFI_IFINDEX=$(cat "$SYS_CLASS_NET/wlan0/ifindex" 2>/dev/null) \
+    || { WIFI_TABLE_ID=; return 1; }
+  case "$WIFI_IFINDEX" in
+    ''|0|0[0-9]*|*[!0-9]*) WIFI_TABLE_ID=; return 1 ;;
+  esac
+  [ "${#WIFI_IFINDEX}" -le 9 ] || { WIFI_TABLE_ID=; return 1; }
+  EXPECTED_WIFI_TABLE_ID=$((WIFI_IFINDEX + 1000))
+  [ "$WIFI_TABLE_ID" = "$EXPECTED_WIFI_TABLE_ID" ] \
+    || { WIFI_TABLE_ID=; return 1; }
+  WIFI_NUMERIC_ROUTES=$("$IP" -4 route show table "$WIFI_TABLE_ID" 2>/dev/null) \
+    || { WIFI_TABLE_ID=; return 1; }
+  printf '%s\n' "$WIFI_NUMERIC_ROUTES" | "$SYSTEM_BIN/awk" '
+    $1 == "default" {
+      defaults++
+      device = ""
+      for (i = 1; i < NF; i++) if ($i == "dev") device = $(i + 1)
+      if (device == "wlan0") exact++
+    }
+    END { exit defaults == 1 && exact == 1 ? 0 : 1 }
+  ' || { WIFI_TABLE_ID=; return 1; }
+  return 0
+}
+
+preflight_wifi_policy() {
+  probe_wifi_interface \
+    || die "wlan0 is unavailable for the Wi-Fi-only host (state=$WIFI_INTERFACE_STATE)"
+  require_no_bridge_overlap
+  probe_wifi_policy || true
+  case "$WIFI_POLICY_STATE" in
+    ready) PREFLIGHT_WIFI_TABLE_ID=; return 0 ;;
+    conflict) die 'IPv4 policy preference 9990 or 9991 is occupied by an unexpected rule' ;;
+    missing) ;;
+    *) die 'cannot inspect existing IPv4 policy rules' ;;
+  esac
+  resolve_wifi_table_id \
+    || die 'cannot resolve the authoritative numeric wlan0 routing table'
+  PREFLIGHT_WIFI_TABLE_ID=$WIFI_TABLE_ID
+}
+
+prepare_route_policy_image() {
+  [ -x "$KSU_BUSYBOX" ] || die 'KernelSU BusyBox is unavailable for policy bootstrap'
+  [ -f "$EXPECTED_ROUTE_POLICY" ] && [ ! -L "$EXPECTED_ROUTE_POLICY" ] &&
+    [ -x "$EXPECTED_ROUTE_POLICY" ] || die 'packaged route-policy helper is unavailable or unsafe'
+  [ -z "$ROUTE_POLICY_TEMP" ] && [ -z "$ROUTE_POLICY_IMAGE" ] \
+    || die 'policy bootstrap temporary state is already active'
+  ROUTE_POLICY_TEMP=$RUN_ROOT/.route-policy.$$
+  [ ! -e "$ROUTE_POLICY_TEMP" ] && [ ! -L "$ROUTE_POLICY_TEMP" ] \
+    || die 'policy bootstrap temporary path already exists'
+  (umask 077; mkdir "$ROUTE_POLICY_TEMP" && mkdir "$ROUTE_POLICY_TEMP/rootfs") \
+    || die 'cannot create policy bootstrap rootfs'
+  "$KSU_BUSYBOX" cp "$EXPECTED_ROUTE_POLICY" "$ROUTE_POLICY_TEMP/rootfs/route-policy" \
+    || die 'cannot stage the packaged route-policy helper'
+  "$KSU_BUSYBOX" chmod 0755 "$ROUTE_POLICY_TEMP/rootfs/route-policy" \
+    || die 'cannot protect the staged route-policy helper'
+  [ -f "$ROUTE_POLICY_TEMP/rootfs/route-policy" ] &&
+    [ ! -L "$ROUTE_POLICY_TEMP/rootfs/route-policy" ] \
+    || die 'staged route-policy helper is unsafe'
+  "$KSU_BUSYBOX" tar -C "$ROUTE_POLICY_TEMP/rootfs" \
+    -cf "$ROUTE_POLICY_TEMP/rootfs.tar" route-policy \
+    || die 'cannot archive the transient policy rootfs'
+  [ -f "$ROUTE_POLICY_TEMP/rootfs.tar" ] && [ ! -L "$ROUTE_POLICY_TEMP/rootfs.tar" ] \
+    || die 'transient policy rootfs archive is unsafe'
+  IMPORTED_IMAGE=$("$EXPECTED_DOCKER" image import - < "$ROUTE_POLICY_TEMP/rootfs.tar") \
+    || die 'cannot import the transient route-policy image'
+  case "$IMPORTED_IMAGE" in
+    sha256:*) IMPORTED_HASH=${IMPORTED_IMAGE#sha256:} ;;
+    *) die 'Docker returned an invalid transient policy image identity' ;;
+  esac
+  [ "${#IMPORTED_HASH}" -eq 64 ] \
+    || die 'Docker returned an invalid transient policy image identity'
+  case "$IMPORTED_HASH" in
+    *[!0-9a-f]*) die 'Docker returned an invalid transient policy image identity' ;;
+  esac
+  ROUTE_POLICY_IMAGE=$IMPORTED_IMAGE
+}
+
+run_route_policy_add() {
+  ROUTE_SELECTOR=$1
+  if [ "$ROUTE_SELECTOR" = to-main ]; then
+    "$EXPECTED_DOCKER" run --pull=never --rm --network host --privileged \
+      "$ROUTE_POLICY_IMAGE" /route-policy add to-main "$BRIDGE_POOL_CIDR" 9990
+  else
+    "$EXPECTED_DOCKER" run --pull=never --rm --network host --privileged \
+      "$ROUTE_POLICY_IMAGE" /route-policy add from-table "$BRIDGE_POOL_CIDR" \
+      "$WIFI_TABLE_ID" 9991
+  fi
+  ROUTE_POLICY_STATUS=$?
+  case "$ROUTE_POLICY_STATUS" in
+    0|3) return 0 ;;
+    *) die "route-policy helper failed for $ROUTE_SELECTOR (status=$ROUTE_POLICY_STATUS)" ;;
+  esac
+}
+
+ensure_wifi_policy() {
+  probe_wifi_interface \
+    || die "wlan0 is unavailable for the Wi-Fi-only host (state=$WIFI_INTERFACE_STATE)"
+  require_no_bridge_overlap
+  probe_wifi_policy || true
+  case "$WIFI_POLICY_STATE" in
+    ready) return 0 ;;
+    conflict) die 'IPv4 policy preference 9990 or 9991 is occupied by an unexpected rule' ;;
+    missing) ;;
+    *) die 'cannot inspect existing IPv4 policy rules' ;;
+  esac
+  resolve_wifi_table_id \
+    || die 'cannot resolve the authoritative numeric wlan0 routing table'
+  [ -z "$PREFLIGHT_WIFI_TABLE_ID" ] || [ "$WIFI_TABLE_ID" = "$PREFLIGHT_WIFI_TABLE_ID" ] \
+    || die 'wlan0 routing table changed while Docker was starting'
+  prepare_route_policy_image
+  [ "$WIFI_TO_MAIN_STATE" = ready ] || run_route_policy_add to-main
+  [ "$WIFI_FROM_TABLE_STATE" = ready ] || run_route_policy_add from-table
+  cleanup_route_policy_artifacts
+  probe_wifi_policy || die "Wi-Fi policy did not converge (state=$WIFI_POLICY_STATE)"
+  probe_wifi_interface \
+    || die "wlan0 changed while Wi-Fi policy was converging (state=$WIFI_INTERFACE_STATE)"
+  VERIFIED_WIFI_TABLE_ID=$WIFI_TABLE_ID
+  resolve_wifi_table_id \
+    || die 'cannot re-verify the authoritative numeric wlan0 routing table'
+  [ "$WIFI_TABLE_ID" = "$VERIFIED_WIFI_TABLE_ID" ] \
+    || die 'wlan0 routing table changed while Wi-Fi policy was converging'
+  require_no_bridge_overlap
+}
+
+probe_ipv4_forwarding() {
+  IPV4_FORWARDING_STATE=unknown
+  [ -f "$IP_FORWARD" ] && [ ! -L "$IP_FORWARD" ] || return 1
+  FORWARD_VALUE=$(cat "$IP_FORWARD" 2>/dev/null) || return 1
+  case "$FORWARD_VALUE" in
+    0) IPV4_FORWARDING_STATE=off; return 1 ;;
+    1) IPV4_FORWARDING_STATE=on; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_ipv4_forwarding() {
+  probe_ipv4_forwarding || true
+  case "$IPV4_FORWARDING_STATE" in
+    on) return 0 ;;
+    off) printf '%s\n' 1 > "$IP_FORWARD" || die 'cannot enable IPv4 forwarding' ;;
+    *) die 'IPv4 forwarding control is unavailable or malformed' ;;
+  esac
+  probe_ipv4_forwarding || die 'IPv4 forwarding did not become enabled'
+}
+
+firewall_root_ready() {
+  "$IPTABLES" -C OUTPUT -o lo -p tcp --dport 2375 -m owner --uid-owner 0 -j ACCEPT >/dev/null 2>&1
+}
+
+firewall_shell_ready() {
+  "$IPTABLES" -C OUTPUT -o lo -p tcp --dport 2375 -m owner --uid-owner 2000 -j ACCEPT >/dev/null 2>&1
+}
+
+firewall_reject_ready() {
+  "$IPTABLES" -C OUTPUT -o lo -p tcp --dport 2375 -j REJECT >/dev/null 2>&1
+}
+
+probe_api_firewall() {
+  API_FIREWALL_STATE=unknown
+  [ -x "$IPTABLES" ] || return 1
+  if firewall_root_ready && firewall_shell_ready && firewall_reject_ready; then
+    API_FIREWALL_STATE=ready
+    return 0
+  fi
+  API_FIREWALL_STATE=missing
+  return 1
+}
+
+ensure_api_firewall() {
+  [ -x "$IPTABLES" ] || die 'iptables is unavailable for Docker API protection'
+  firewall_reject_ready ||
+    "$IPTABLES" -I OUTPUT 1 -o lo -p tcp --dport 2375 -j REJECT \
+      || die 'cannot install Docker API reject rule'
+  firewall_shell_ready ||
+    "$IPTABLES" -I OUTPUT 1 -o lo -p tcp --dport 2375 -m owner --uid-owner 2000 -j ACCEPT \
+      || die 'cannot install Docker API shell rule'
+  firewall_root_ready ||
+    "$IPTABLES" -I OUTPUT 1 -o lo -p tcp --dport 2375 -m owner --uid-owner 0 -j ACCEPT \
+      || die 'cannot install Docker API root rule'
+  probe_api_firewall || die 'Docker API firewall prerequisites did not converge'
+}
+
+print_status() {
+  read_host_config || true
+  probe_daemon
+  case "$DAEMON_STATE" in
+    running)
+      probe_inventory || true
+      ;;
+    stopped|stale-pidfile)
+      INVENTORY_COUNT=0
+      ;;
+    *)
+      INVENTORY_COUNT=unknown
+      ;;
+  esac
+  probe_storage
+  probe_wifi_interface || true
+  probe_bridge_routes || true
+  probe_wifi_policy || true
+  probe_ipv4_forwarding || true
+  probe_api_firewall || true
+  printf '%s\n' \
+    'schema_version=2' \
+    "daemon=$DAEMON_STATE" \
+    "containers=$INVENTORY_COUNT" \
+    "autostart=$AUTOSTART_STATE" \
+    "host_config=$HOST_CONFIG_STATE" \
+    "disk=$DISK_STATE" \
+    "mount=$MOUNT_STATE" \
+    "wifi_interface=$WIFI_INTERFACE_STATE" \
+    "bridge_routes=$BRIDGE_ROUTE_STATE" \
+    "wifi_policy=$WIFI_POLICY_STATE" \
+    "ipv4_forwarding=$IPV4_FORWARDING_STATE" \
+    "api_firewall=$API_FIREWALL_STATE"
+  case "$DAEMON_STATE:$AUTOSTART_STATE:$INVENTORY_COUNT" in
+    running:on:*|running:off:*|stopped:on:0|stopped:off:0|stale-pidfile:on:0|stale-pidfile:off:0) ;;
+    *) return 1 ;;
+  esac
+  case "$HOST_CONFIG_STATE:$DISK_STATE:$MOUNT_STATE" in
+    invalid:*|*:unsafe:*|*:unknown:*|*:size-mismatch:*|*:dirty:*|*:mount-conflict:*|*:*:ambiguous|*:*:wrong-*) return 1 ;;
+  esac
+  if [ "$DAEMON_STATE" = running ]; then
+    [ "$HOST_CONFIG_STATE:$DISK_STATE:$MOUNT_STATE:$WIFI_INTERFACE_STATE:$BRIDGE_ROUTE_STATE:$WIFI_POLICY_STATE:$IPV4_FORWARDING_STATE:$API_FIREWALL_STATE" = \
+      'ready:ready:ready:ready:ready:ready:on:ready' ] || return 1
+  fi
+  return 0
+}
+
+require_start_prerequisites() {
+  resolve_active_release || die 'active host release is unavailable or unsafe'
+  for REQUIRED_EXECUTABLE in \
+    "$EXPECTED_DOCKER" \
+    "$EXPECTED_DOCKERD" \
+    "$EXPECTED_CONTAINERD" \
+    "$EXPECTED_DOCKERD_SCRIPT" \
+    "$EXPECTED_ROUTE_POLICY"
+  do
+    [ -f "$REQUIRED_EXECUTABLE" ] && [ -x "$REQUIRED_EXECUTABLE" ] \
+      || die "required executable is unavailable: $REQUIRED_EXECUTABLE"
+  done
+  grep -qx 'HOSTCTL_RUNTIME_ONLY_CONTRACT=1' "$EXPECTED_DOCKERD_SCRIPT" 2>/dev/null \
+    || die 'Docker launcher lacks the reviewed runtime-only contract'
+}
+
+require_kernel_capabilities() {
+  [ -x "$KSU_BUSYBOX" ] || die 'KernelSU BusyBox is unavailable for kernel capability verification'
+  [ -f "$KERNEL_CONFIG" ] && [ ! -L "$KERNEL_CONFIG" ] \
+    || die 'running kernel configuration is unavailable; refusing Docker start'
+  "$KSU_BUSYBOX" zcat "$KERNEL_CONFIG" 2>/dev/null | "$SYSTEM_BIN/awk" '
+    $0 == "CONFIG_PID_NS=y" { pid++ }
+    $0 == "CONFIG_IPC_NS=y" { ipc++ }
+    $0 == "CONFIG_USER_NS=y" { user++ }
+    $0 == "CONFIG_SYSVIPC=y" { sysvipc++ }
+    $0 == "CONFIG_POSIX_MQUEUE=y" { mqueue++ }
+    END {
+      if (pid == 1 && ipc == 1 && user == 1 && sysvipc == 1 && mqueue == 1) exit 0
+      exit 1
+    }
+  ' >/dev/null 2>&1 || die 'required Docker kernel capabilities are unavailable; use the module Action'
+}
+
+start_host() {
+  acquire_lock
+  require_workload_profile
+  probe_daemon
+  case "$DAEMON_STATE" in
+    running) DAEMON_ALREADY_RUNNING=1 ;;
+    stale-pidfile|foreign-pid)
+      remove_inactive_pidfile
+      DAEMON_ALREADY_RUNNING=0
+      ;;
+    stopped) DAEMON_ALREADY_RUNNING=0 ;;
+    *) die "Docker daemon identity is $DAEMON_STATE; refusing a second daemon" ;;
+  esac
+  require_start_prerequisites
+  require_kernel_capabilities
+  require_runtime_config
+  preflight_wifi_policy
+  ensure_disk_image
+  ensure_data_mount
+  ensure_ipv4_forwarding
+  ensure_api_firewall
+  if [ "$DAEMON_ALREADY_RUNNING" = 1 ]; then
+    ensure_wifi_policy
+    POST_START_PID=$DAEMON_PID
+    run_workload_profile_hook post-start
+    if [ "$WORKLOAD_PROFILE_STATE" = ready ]; then
+      reprove_daemon_after_workload_hook "$POST_START_PID" post-start
+    fi
+    printf '%s\n' 'result=running'
+    return 0
+  fi
+  "$SETSID" "$EXPECTED_DOCKERD_SCRIPT" --runtime-only </dev/null >/dev/null 2>&1 &
+  START_ATTEMPT=0
+  while [ "$START_ATTEMPT" -lt "$READY_TRIES" ]; do
+    "$SLEEP" "$SLEEP_SECONDS"
+    probe_daemon
+    if [ "$DAEMON_STATE" = running ]; then
+      break
+    fi
+    case "$DAEMON_STATE" in
+      foreign-pid|invalid-pidfile|multiple-daemons|multiple-containerd|pidfile-mismatch|unmanaged-daemon|*-exe-mismatch|*-argv0-mismatch) break ;;
+    esac
+    START_ATTEMPT=$((START_ATTEMPT + 1))
+  done
+  [ "$DAEMON_STATE" = running ] \
+    || die "Docker did not become ready (state=$DAEMON_STATE); no signal was sent"
+  ensure_wifi_policy
+  POST_START_PID=$DAEMON_PID
+  run_workload_profile_hook post-start
+  if [ "$WORKLOAD_PROFILE_STATE" = ready ]; then
+    reprove_daemon_after_workload_hook "$POST_START_PID" post-start
+  fi
+  printf '%s\n' 'result=running'
+}
+
+stop_host() {
+  acquire_lock
+  probe_daemon
+  case "$DAEMON_STATE" in
+    stopped)
+      printf '%s\n' 'result=stopped'
+      return 0
+      ;;
+    stale-pidfile|foreign-pid)
+      remove_inactive_pidfile
+      printf '%s\n' 'result=stopped'
+      return 0
+      ;;
+    running) ;;
+    *) die "Docker daemon identity is $DAEMON_STATE; refusing stop" ;;
+  esac
+
+  STOP_PID=$DAEMON_PID
+  run_workload_profile_hook pre-stop
+  if [ "$WORKLOAD_PROFILE_STATE" = ready ]; then
+    reprove_daemon_after_workload_hook "$STOP_PID" pre-stop
+  fi
+  if ! probe_inventory; then
+    die 'Docker container inventory is unknown; refusing stop'
+  fi
+  [ "$INVENTORY_COUNT" -eq 0 ] || die "Docker has $INVENTORY_COUNT running container(s); refusing stop"
+  probe_daemon
+  [ "$DAEMON_STATE" = running ] && [ "$DAEMON_PID" = "$STOP_PID" ] && exact_daemon_pid "$STOP_PID" \
+    || die 'Docker daemon identity changed before TERM'
+  "$KILL" -TERM "$STOP_PID" 2>/dev/null || die 'Docker daemon rejected TERM'
+
+  STOP_ATTEMPT=0
+  while [ "$STOP_ATTEMPT" -lt "$STOP_TRIES" ]; do
+    scan_exact_processes "$EXPECTED_DOCKERD" "$DOCKERD"
+    STOP_DOCKERD_COUNT=$SCAN_COUNT
+    STOP_ARGV0_MISMATCH_COUNT=$SCAN_ARGV0_MISMATCH_COUNT
+    STOP_FOREIGN_EXE_COUNT=$SCAN_FOREIGN_EXE_COUNT
+    scan_exact_processes "$EXPECTED_CONTAINERD" "$CONTAINERD" containerd
+    STOP_CONTAINERD_COUNT=$SCAN_COUNT
+    STOP_CONTAINERD_ARGV0_MISMATCH_COUNT=$SCAN_ARGV0_MISMATCH_COUNT
+    STOP_CONTAINERD_FOREIGN_EXE_COUNT=$SCAN_FOREIGN_EXE_COUNT
+    [ "$STOP_FOREIGN_EXE_COUNT" -eq 0 ] \
+      || die 'Docker daemon executable became ambiguous after TERM; no force signal was sent'
+    [ "$STOP_ARGV0_MISMATCH_COUNT" -eq 0 ] \
+      || die 'Docker daemon identity became ambiguous after TERM; no force signal was sent'
+    [ "$STOP_CONTAINERD_FOREIGN_EXE_COUNT" -eq 0 ] \
+      || die 'containerd executable became ambiguous after TERM; no force signal was sent'
+    [ "$STOP_CONTAINERD_ARGV0_MISMATCH_COUNT" -eq 0 ] \
+      || die 'containerd identity became ambiguous after TERM; no force signal was sent'
+    if [ "$STOP_DOCKERD_COUNT" -eq 0 ] && [ "$STOP_CONTAINERD_COUNT" -eq 0 ] &&
+       ! docker_info && ! socket_present; then
+      break
+    fi
+    "$SLEEP" "$SLEEP_SECONDS"
+    STOP_ATTEMPT=$((STOP_ATTEMPT + 1))
+  done
+  [ "$STOP_DOCKERD_COUNT" -eq 0 ] && [ "$STOP_CONTAINERD_COUNT" -eq 0 ] \
+    || die 'Docker did not stop after TERM; no force signal was sent'
+  ! docker_info && ! socket_present \
+    || die 'Docker process exited but its endpoint remains; no force signal was sent'
+  if [ -e "$DOCKER_PIDFILE" ] || [ -L "$DOCKER_PIDFILE" ]; then
+    read_pidfile && [ "$READ_PID" = "$STOP_PID" ] && [ ! -d "$PROC_ROOT/$STOP_PID" ] \
+      || die 'Docker stopped with an unexpected pidfile identity'
+    rm -f "$DOCKER_PIDFILE" || die 'cannot remove proved-stale Docker pidfile'
+  fi
+  printf '%s\n' 'result=stopped'
+}
+
+set_autostart() {
+  case "$1" in
+    on) AUTOSTART_VALUE=1 ;;
+    off) AUTOSTART_VALUE=0 ;;
+    *) usage ;;
+  esac
+  acquire_lock
+  validate_existing_autostart
+  write_autostart "$AUTOSTART_VALUE"
+  printf 'result=autostart-%s\n' "$1"
+}
+
+configure_disk_size() {
+  CONFIGURE_SIZE=$1
+  validate_disk_size "$CONFIGURE_SIZE" && [ "$CONFIGURE_SIZE" != 0 ] \
+    || die "disk size must be decimal, 4096-byte aligned, and between $DISK_MIN_BYTES and $DISK_MAX_BYTES bytes"
+  read_host_config || die 'existing host config is malformed or unsafe; refusing replacement'
+  if [ -e "$DOCKER_DISK" ] || [ -L "$DOCKER_DISK" ]; then
+    [ -f "$DOCKER_DISK" ] && [ ! -L "$DOCKER_DISK" ] \
+      || die 'existing Docker disk path is unsafe; refusing configuration change'
+    EXISTING_DISK_SIZE=$("$STAT" -c %s "$DOCKER_DISK" 2>/dev/null) \
+      || die 'cannot inspect existing Docker disk size'
+    [ "$EXISTING_DISK_SIZE" = "$CONFIGURE_SIZE" ] \
+      || die 'requested size differs from the existing Docker disk; refusing resize or replacement'
+  fi
+  case "$AUTOSTART_STATE" in on) CONFIGURE_AUTOSTART=1 ;; off) CONFIGURE_AUTOSTART=0 ;; *) die 'autostart state is unknown' ;; esac
+  case "$HOST_CONFIG_STATE" in
+    ready|unconfigured) CONFIGURE_CIDR=$BRIDGE_POOL_CIDR ;;
+    missing|legacy) CONFIGURE_CIDR=$DEFAULT_BRIDGE_POOL_CIDR ;;
+    *) die 'existing host config is malformed or unsafe; refusing replacement' ;;
+  esac
+  publish_config "$CONFIGURE_AUTOSTART" "$CONFIGURE_SIZE" "$CONFIGURE_CIDR"
+  read_host_config || die 'published host config failed verification'
+  [ "$HOST_CONFIG_STATE" = ready ] && [ "$DISK_SIZE_BYTES" = "$CONFIGURE_SIZE" ] \
+    || die 'published disk configuration failed verification'
+}
+
+disk_init() {
+  DISK_INIT_SIZE=${1:-}
+  acquire_lock
+  probe_daemon
+  case "$DAEMON_STATE" in
+    stopped) ;;
+    stale-pidfile|foreign-pid) remove_inactive_pidfile ;;
+    running)
+      [ -z "$DISK_INIT_SIZE" ] \
+        || die 'Docker is running; refusing disk configuration change'
+      ;;
+    *) die "Docker daemon identity is $DAEMON_STATE; refusing disk initialization" ;;
+  esac
+  if [ -n "$DISK_INIT_SIZE" ]; then
+    configure_disk_size "$DISK_INIT_SIZE"
+  fi
+  require_runtime_config
+  require_no_bridge_overlap
+  ensure_disk_image
+  ensure_data_mount
+  printf '%s\n' 'result=disk-ready'
+}
+
+[ "$#" -ge 1 ] || usage
+COMMAND=$1
+shift
+case "$COMMAND" in
+  status) [ "$#" -eq 0 ] || usage ;;
+  start) [ "$#" -eq 0 ] || usage ;;
+  stop) [ "$#" -eq 0 ] || usage ;;
+  autostart) [ "$#" -eq 1 ] || usage ;;
+  disk-init)
+    if [ "$#" -eq 0 ]; then
+      DISK_INIT_SIZE=
+    elif [ "$#" -eq 2 ] && [ "$1" = --size-bytes ]; then
+      DISK_INIT_SIZE=$2
+    else
+      usage
+    fi
+    ;;
+  *) usage ;;
+esac
+[ "$("$ID" -u 2>/dev/null || printf unknown)" = 0 ] || die 'root is required' 2
+
+case "$COMMAND" in
+  status) print_status ;;
+  start) start_host ;;
+  stop) stop_host ;;
+  autostart) set_autostart "$1" ;;
+  disk-init) disk_init "$DISK_INIT_SIZE" ;;
+esac

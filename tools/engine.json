@@ -1,0 +1,98 @@
+{
+  "engine": {
+    "version": "29.8.0",
+    "tarball": {
+      "url": "https://download.docker.com/linux/static/stable/aarch64/docker-29.8.0.tgz",
+      "size": 77727467,
+      "sha256": "1462a696be6029bd478d7d60d7f3c31cdd15affd1178a4a278aaf4a1d1b7f8b5"
+    },
+    "note": "Docker publishes no checksum for static tarballs; this pin was recorded from a download on 2026-09-06."
+  },
+  "components": {
+    "moby": {
+      "version": "29.8.0",
+      "commit": "3ce5872b7950c63ba2ffbc5123101019ff3e6682",
+      "license": "Apache-2.0",
+      "repository": "https://github.com/moby/moby"
+    },
+    "docker-cli": {
+      "version": "29.8.0",
+      "commit": "88096ef00576baf72a9cb45caa45c0544c40e0a7",
+      "license": "Apache-2.0",
+      "repository": "https://github.com/docker/cli"
+    },
+    "containerd": {
+      "version": "2.3.4",
+      "commit": "db8809540e1a7a9da5d518876894933ff55692ab",
+      "license": "Apache-2.0",
+      "repository": "https://github.com/containerd/containerd"
+    },
+    "runc": {
+      "version": "1.5.1",
+      "commit": "8f2685a471d3347a686ad3909783d8aafc6bb208",
+      "license": "Apache-2.0",
+      "repository": "https://github.com/opencontainers/runc"
+    },
+    "tini": {
+      "version": "0.19.0",
+      "commit": "de40ad007797e0dcd8b7126f27bb87401d224240",
+      "license": "MIT",
+      "repository": "https://github.com/krallin/tini"
+    }
+  },
+  "rules": [
+    { "from": "/run/containerd", "to": "/dev/containerd" },
+    { "from": "/run/docker/plugins", "to": "/dev/docker/plugins" },
+    { "from": "/run/docker/metrics.sock", "to": "/dev/docker/metrics.sock" }
+  ],
+  "binaries": {
+    "dockerd": {
+      "size": 95181536,
+      "inputSha256": "d2997001cfb25b60b05834f8faf248e5c18924b58117ddad9bb8574d5fdc89ad",
+      "replacements": { "/run/containerd": 3, "/run/docker/plugins": 1, "/run/docker/metrics.sock": 1 },
+      "sha256": "250bbfc1c5e6d21a6b0759e01de4cbd675531278c0ed649353717f752c291ea3"
+    },
+    "containerd": {
+      "size": 35848354,
+      "inputSha256": "4c14bb60b04edc67d298bac605d7012ce91dd940e46270559a49b32a28e82699",
+      "replacements": { "/run/containerd": 3 },
+      "sha256": "4b9fbf9754d24362e6e91787e5436c055a64ad3a23e62615845a4018615bb479"
+    },
+    "containerd-shim-runc-v2": {
+      "size": 8061090,
+      "inputSha256": "d144d1270e60e580bff38510f3a38b3cc94d10a7efe7fb1f9839b4faba383a51",
+      "replacements": { "/run/containerd": 2 },
+      "sha256": "ab3c0811bfed1e11f04ea2ee3bac417358c45622f876e78886ec4dc95cde6aaa"
+    },
+    "docker": {
+      "size": 41522848,
+      "inputSha256": "3b6dd39bc70945a53810cb698b1f29cd41c03682cab47cdc1f2b07b1264f11d8",
+      "replacements": {},
+      "sha256": "3b6dd39bc70945a53810cb698b1f29cd41c03682cab47cdc1f2b07b1264f11d8"
+    },
+    "runc": {
+      "size": 14188976,
+      "inputSha256": "54c1098ed2aa022dc1c8b0ef749f06cf75f56889c2455be2eedef7d495117472",
+      "replacements": {},
+      "sha256": "54c1098ed2aa022dc1c8b0ef749f06cf75f56889c2455be2eedef7d495117472"
+    },
+    "docker-init": {
+      "size": 601296,
+      "inputSha256": "ab2244312e069c6c97bece2437f61fb01db474eae5b0f1ce006162e212eae5b0",
+      "replacements": {},
+      "sha256": "ab2244312e069c6c97bece2437f61fb01db474eae5b0f1ce006162e212eae5b0"
+    },
+    "docker-proxy": {
+      "size": 2625433,
+      "inputSha256": "547c8c305f71639deaf5e53c254f1483a03a051a60665b0a5b9a3d1b7ec1f436",
+      "replacements": {},
+      "sha256": "547c8c305f71639deaf5e53c254f1483a03a051a60665b0a5b9a3d1b7ec1f436"
+    },
+    "ctr": {
+      "size": 21037218,
+      "inputSha256": "2f15982a7d77c4d120e1e9cfbfa339602d006e0f617d12b44c48fa691cf91ef6",
+      "replacements": {},
+      "sha256": "2f15982a7d77c4d120e1e9cfbfa339602d006e0f617d12b44c48fa691cf91ef6"
+    }
+  }
+}

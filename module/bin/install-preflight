@@ -1,0 +1,391 @@
+#!/system/bin/sh
+# Read-only installer compatibility gate. This helper validates the package's
+# flat installer records and the current boot identity. It never installs,
+# downloads, writes a partition, or changes /data.
+set -u
+set -f
+
+PROGRAM=install-preflight
+BUSYBOX=/data/adb/ksu/bin/busybox
+SYSTEM_BIN=/system/bin
+BOOT_CONFIG=/proc/bootconfig
+BOOT_DEVICE_ROOT=/dev/block/by-name
+MODDIR=${0%/*}
+MODDIR=${MODDIR%/*}
+INPUTS=$MODDIR/installer-inputs.tsv
+SWAP_BOOT_KERNEL=$MODDIR/bin/swap-boot-kernel
+
+fail() {
+  printf '%s: %s\n' "$PROGRAM" "$1" >&2
+  exit "${2:-1}"
+}
+
+bb() {
+  "$BUSYBOX" "$@"
+}
+
+valid_sha256() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+canonical_unsigned() {
+  case "$1" in 0|[1-9]* ) ;; *) return 1 ;; esac
+  case "$1" in *[!0-9]*) return 1 ;; esac
+}
+
+boot_device_is_expected_type() {
+  [ -b "$1" ]
+}
+
+hash_installer_inputs() {
+  INPUT_HASH_LINE=$(bb sha256sum "$INPUTS" 2>/dev/null) || return 1
+  HASH_OLD_IFS=$IFS
+  IFS=' '
+  # Word splitting is intentional after pathname expansion has been disabled.
+  # shellcheck disable=SC2086
+  set -- $INPUT_HASH_LINE
+  IFS=$HASH_OLD_IFS
+  if [ "$#" -ne 2 ] || [ "$2" != "$INPUTS" ] || ! valid_sha256 "$1"; then
+    return 1
+  fi
+  INPUT_HASH=$1
+}
+
+PREFLIGHT_CONTEXT=installer
+case "$#:${1:-}" in
+  0:) ;;
+  1:--runtime) PREFLIGHT_CONTEXT=runtime ;;
+  *) fail 'usage: install-preflight [--runtime]' 2 ;;
+esac
+[ -x "$BUSYBOX" ] || fail 'KernelSU BusyBox is unavailable'
+[ "$(bb id -u 2>/dev/null || true)" = 0 ] || fail 'root is required'
+[ "${KSU:-}" = true ] || fail 'a contract-compatible KernelSU installer is required'
+if [ "$PREFLIGHT_CONTEXT" = installer ]; then
+  [ "${BOOTMODE:-}" = true ] || fail 'installation from a contract-compatible manager is required'
+  [ "${ARCH:-}" = arm64 ] || fail "unsupported architecture: ${ARCH:-unknown}"
+fi
+case "${KSU_VER_CODE:-}" in
+  ''|*[!0-9]*) fail 'KernelSU version code is unavailable or invalid' ;;
+esac
+KSU_VERSION=${KSU_VER:-}
+case "$KSU_VERSION" in v*) KSU_VERSION=${KSU_VERSION#v} ;; esac
+case "$KSU_VERSION" in
+  ''|*[!0-9.]*) fail 'KernelSU version is unavailable or invalid' ;;
+esac
+[ "${KSU_RUNTIME_MODE:-}" = lkm ] \
+  || fail 'KernelSU runtime mode must be lkm'
+
+[ -f "$INPUTS" ] && [ ! -L "$INPUTS" ] \
+  || fail 'installer inputs must be a regular file'
+[ -f "$SWAP_BOOT_KERNEL" ] && [ ! -L "$SWAP_BOOT_KERNEL" ] && [ -x "$SWAP_BOOT_KERNEL" ] \
+  || fail 'boot inspection helper is unavailable or unsafe'
+
+# Shell command substitution cannot retain NUL and strips trailing newlines.
+# Under the C locale, this size check therefore requires exactly one final LF
+# and rejects NUL or other bytes that the shell could silently discard.
+export LC_ALL=C
+INPUT_SIZE=$(bb stat -c '%s' "$INPUTS" 2>/dev/null) \
+  || fail 'cannot measure installer inputs'
+canonical_unsigned "$INPUT_SIZE" || fail 'installer inputs have an invalid size'
+[ "$INPUT_SIZE" -gt 0 ] && [ "$INPUT_SIZE" -le 262144 ] \
+  || fail 'installer inputs exceed the bounded size'
+INPUT_TEXT=$(bb cat "$INPUTS" 2>/dev/null) || fail 'cannot read installer inputs'
+[ "$INPUT_SIZE" -eq $((${#INPUT_TEXT} + 1)) ] \
+  || fail 'installer inputs must be canonical LF-terminated text'
+unset INPUT_TEXT
+hash_installer_inputs || fail 'cannot hash installer inputs'
+PINNED_INPUT_HASH=$INPUT_HASH
+
+DEVICE=$($SYSTEM_BIN/getprop ro.product.device 2>/dev/null) \
+  || fail 'cannot read product device'
+FINGERPRINT=$($SYSTEM_BIN/getprop ro.build.fingerprint 2>/dev/null) \
+  || fail 'cannot read build fingerprint'
+ANDROID_VERSION=$($SYSTEM_BIN/getprop ro.build.version.release 2>/dev/null) \
+  || fail 'cannot read Android version'
+SECURITY_PATCH=$($SYSTEM_BIN/getprop ro.build.version.security_patch 2>/dev/null) \
+  || fail 'cannot read security patch level'
+KERNEL_RELEASE=$(bb uname -r 2>/dev/null) || fail 'cannot read kernel release'
+for OBSERVED in "$DEVICE" "$FINGERPRINT" "$ANDROID_VERSION" "$SECURITY_PATCH" "$KERNEL_RELEASE"
+do
+  [ -n "$OBSERVED" ] || fail 'required device identity is unavailable'
+done
+case "$DEVICE" in *[!a-z0-9_-]*) fail 'product device has an invalid form' ;; esac
+case "$FINGERPRINT" in *[!A-Za-z0-9._:/+-]*) fail 'build fingerprint has an invalid form' ;; esac
+canonical_unsigned "$ANDROID_VERSION" || fail 'Android version has an invalid form'
+[ "$ANDROID_VERSION" -gt 0 ] || fail 'Android version has an invalid form'
+[ "${#SECURITY_PATCH}" -eq 10 ] || fail 'security patch level has an invalid form'
+case "$SECURITY_PATCH" in
+  ????-??-??) ;;
+  *) fail 'security patch level has an invalid form' ;;
+esac
+case "$SECURITY_PATCH" in *[!0-9-]*) fail 'security patch level has an invalid form' ;; esac
+case "$KERNEL_RELEASE" in *[!A-Za-z0-9._+-]*) fail 'kernel release has an invalid form' ;; esac
+
+TAB=$(printf '\t')
+# The single-quoted program is passed to awk; shell expansion is not intended.
+# shellcheck disable=SC2016
+SELECTED=$(bb awk -F "$TAB" \
+  -v device="$DEVICE" \
+  -v fingerprint="$FINGERPRINT" \
+  -v android="$ANDROID_VERSION" \
+  -v patch="$SECURITY_PATCH" \
+  -v kernel="$KERNEL_RELEASE" \
+  -v ksu_version="$KSU_VERSION" \
+  -v ksu_mode="$KSU_RUNTIME_MODE" '
+  function reject() { bad = 1; exit 1 }
+  function uint(value) { return value ~ /^(0|[1-9][0-9]*)$/ }
+  function positive(value) { return uint(value) && value != "0" }
+  function hash(value) { return length(value) == 64 && value !~ /[^0-9a-f]/ }
+  function safe(value) { return value ~ /^[A-Za-z0-9][A-Za-z0-9._+-]*$/ }
+  function build_id(value, parts, count, position) {
+    if (value !~ /^[A-Z0-9.]+$/) return 0
+    count = split(value, parts, ".")
+    if (count < 2) return 0
+    for (position = 1; position <= count; position++)
+      if (parts[position] !~ /^[A-Z0-9]+$/) return 0
+    return 1
+  }
+  function semver(value, parts, count, position) {
+    if (value !~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/) return 0
+    count = split(value, parts, ".")
+    if (count != 3) return 0
+    for (position = 1; position <= 3; position++) if (!uint(parts[position])) return 0
+    return 1
+  }
+  function clean_fields(position) {
+    for (position = 1; position <= NF; position++)
+      if ($position !~ /^[ -~]+$/) return 0
+    return 1
+  }
+  NR == 1 {
+    if (NF != 1 || $1 != "INSTALLER_INPUTS_VERSION=1") reject()
+    next
+  }
+  {
+    if (!clean_fields()) reject()
+    type = $1
+    if (type == "MODULE") {
+      if (phase != 0 || NF != 3 || module_count++ || !safe($2) || !positive($3)) reject()
+      module_version = $2
+      phase = 1
+    } else if (type == "ENGINE") {
+      if (phase != 1 || NF != 6 || engine_count++ || !semver($2) || !safe($3) ||
+          $3 != "docker-" $2 ".tgz" || !positive($4) || !hash($5) ||
+          $6 != "https://download.docker.com/linux/static/stable/aarch64/" $3) reject()
+      phase = 2
+    } else if (type == "RULE") {
+      if (phase != 2 && phase != 3) reject()
+      phase = 3
+      if (NF != 4 || $2 != sprintf("%d", rule_count) || substr($3, 1, 1) != "/" ||
+          substr($4, 1, 1) != "/" || length($3) != length($4) || $3 in rules) reject()
+      rules[$3] = 1
+      rule_count++
+    } else if (type == "BINARY") {
+      if (phase != 3 && phase != 4) reject()
+      phase = 4
+      split("containerd containerd-shim-runc-v2 ctr docker docker-init docker-proxy dockerd runc", names, " ")
+      if (NF != 9 || binary_count >= 8 || $2 != names[binary_count + 1] ||
+          !positive($3) || !hash($4) || !hash($5) || $6 !~ /^[01]$/ ||
+          !uint($7) || !uint($8) || !uint($9)) reject()
+      if (($6 == "0" && ($7 != "0" || $8 != "0" || $9 != "0")) ||
+          ($6 == "1" && ($7 + $8 + $9 == 0))) reject()
+      binary_count++
+    } else if (type == "BUILD") {
+      if (phase != 4 && phase != 5) reject()
+      phase = 5
+      if (binary_count != 8 || NF != 13 || !build_id($2) || $2 in builds ||
+          $3 !~ /^[a-z0-9_-]+$/ || $4 !~ /^[A-Za-z0-9._:\/+-]+$/ || !positive($5) ||
+          $6 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ || !safe($7) ||
+          !positive($8) || !positive($9) || !uint($10) || !positive($11) ||
+          !uint($12) || $13 != "Image-" $2 ".lz4" || !safe($13)) reject()
+      if (previous_build != "" && ("x" $2) <= ("x" previous_build)) reject()
+      previous_build = $2
+      builds[$2] = 1
+      partition_size[$2] = $8
+      build_count++
+      if (("x" $3) == ("x" device) && ("x" $4) == ("x" fingerprint) &&
+          ("x" $5) == ("x" android) && ("x" $6) == ("x" patch) &&
+          ("x" $7) == ("x" kernel)) {
+        selected_count++
+        selected_id = $2
+        selected_partition = $8
+      }
+    } else if (type == "KSU") {
+      if (phase != 5 && phase != 6) reject()
+      phase = 6
+      key = $2 SUBSEP $3 SUBSEP $4
+      if (NF != 4 || !($2 in builds) || $3 != "lkm" || !semver($4) || key in ksu_rows) reject()
+      sort_key = $2 "\t" $4
+      if (previous_ksu != "" && ("x" sort_key) <= ("x" previous_ksu)) reject()
+      previous_ksu = sort_key
+      ksu_rows[key] = 1
+      build_ksu[$2]++
+      ksu_count++
+      if ($2 == selected_id && $3 == ksu_mode && $4 == ksu_version) selected_ksu++
+    } else if (type == "BOOT_STATE") {
+      if (phase != 6 && phase != 7) reject()
+      phase = 7
+      key = $2 SUBSEP $3
+      pair = $2 SUBSEP $4 SUBSEP $5 SUBSEP $6 SUBSEP $7
+      full = $2 SUBSEP $6 SUBSEP $7
+      payload = $4 SUBSEP $5
+      if (NF != 7 || !($2 in builds) || $3 !~ /^[a-z][a-z0-9-]*$/ ||
+          !positive($4) || !hash($5) || !positive($6) || !hash($7) ||
+          $6 != partition_size[$2] || key in boot_roles || pair in boot_pairs ||
+          (full in full_payload && full_payload[full] != payload)) reject()
+      sort_key = $2 "\t" $3
+      if (previous_boot != "" && ("x" sort_key) <= ("x" previous_boot)) reject()
+      previous_boot = sort_key
+      boot_roles[key] = 1
+      boot_pairs[pair] = 1
+      full_payload[full] = payload
+      build_boot[$2]++
+      if ($3 == "current-public") build_current[$2]++
+      boot_count++
+    } else {
+      reject()
+    }
+  }
+  END {
+    for (build in builds)
+      if (build_ksu[build] < 1 || build_boot[build] < 2 || build_current[build] != 1) bad = 1
+    if (bad || NR < 2 || module_count != 1 || engine_count != 1 || rule_count != 3 ||
+        binary_count != 8 || build_count < 1 || ksu_count < 1 || boot_count < 1 ||
+        selected_count != 1 || selected_ksu != 1) exit 1
+    print selected_id "\t" selected_partition "\t" module_version
+  }
+' "$INPUTS") || fail 'installer inputs are malformed or do not authorize this device'
+hash_installer_inputs || fail 'cannot rehash installer inputs'
+[ "$INPUT_HASH" = "$PINNED_INPUT_HASH" ] \
+  || fail 'installer inputs changed during build selection'
+
+OLD_IFS=$IFS
+IFS=$TAB
+# Word splitting is intentional after pathname expansion has been disabled.
+# shellcheck disable=SC2086
+set -- $SELECTED
+IFS=$OLD_IFS
+[ "$#" -eq 3 ] || fail 'installer build selection is malformed'
+BUILD_ID=$1
+EXPECTED_PARTITION_SIZE=$2
+MODULE_VERSION=$3
+canonical_unsigned "$EXPECTED_PARTITION_SIZE" \
+  || fail 'installer build has an invalid partition size'
+
+SLOT_SUFFIX=$($SYSTEM_BIN/getprop ro.boot.slot_suffix 2>/dev/null) \
+  || fail 'cannot read active slot suffix'
+case "$SLOT_SUFFIX" in
+  _a|_b) ;;
+  *) fail 'active slot suffix has an invalid form' ;;
+esac
+# Android exposes the bootloader-selected suffix independently in bootconfig.
+# Require one canonical record so a missing, malformed, or ambiguous source
+# cannot be treated as agreement with getprop.
+# The single-quoted program is passed to awk; shell expansion is not intended.
+# shellcheck disable=SC2016
+BOOTCONFIG_SLOT=$(bb awk '
+  $1 == "androidboot.slot_suffix" {
+    count++
+    if (NF != 3 || $2 != "=" || ($3 != "\"_a\"" && $3 != "\"_b\""))
+      bad = 1
+    else
+      slot = substr($3, 2, 2)
+  }
+  END {
+    if (bad || count != 1) exit 1
+    print slot
+  }
+' "$BOOT_CONFIG" 2>/dev/null) \
+  || fail 'cannot read one exact active slot suffix from bootconfig'
+[ "$SLOT_SUFFIX" = "$BOOTCONFIG_SLOT" ] \
+  || fail 'active slot suffix and bootconfig disagree'
+BOOT_DEVICE=$BOOT_DEVICE_ROOT/boot$SLOT_SUFFIX
+boot_device_is_expected_type "$BOOT_DEVICE" \
+  || fail 'active boot path is not a block device'
+
+FIRST_SIZE=$($SYSTEM_BIN/blockdev --getsize64 "$BOOT_DEVICE" 2>/dev/null) \
+  || fail 'cannot measure active boot partition'
+canonical_unsigned "$FIRST_SIZE" || fail 'active boot partition size is invalid'
+[ "$FIRST_SIZE" = "$EXPECTED_PARTITION_SIZE" ] \
+  || fail 'active boot partition size does not match the selected build'
+
+FIRST_FULL_LINE=$(bb sha256sum "$BOOT_DEVICE" 2>/dev/null) \
+  || fail 'cannot hash active boot partition'
+IFS=' '
+# Word splitting is intentional after pathname expansion has been disabled.
+# shellcheck disable=SC2086
+set -- $FIRST_FULL_LINE
+IFS=$OLD_IFS
+if [ "$#" -ne 2 ] || [ "$2" != "$BOOT_DEVICE" ] || ! valid_sha256 "$1"; then
+  fail 'active boot partition hash output is malformed'
+fi
+FIRST_FULL_HASH=$1
+
+PAYLOAD_LINE=$($SWAP_BOOT_KERNEL --print-kernel-sha256 "$BOOT_DEVICE" 2>/dev/null) \
+  || fail 'cannot inspect active boot kernel payload'
+IFS=' '
+# Word splitting is intentional after pathname expansion has been disabled.
+# shellcheck disable=SC2086
+set -- $PAYLOAD_LINE
+IFS=$OLD_IFS
+if [ "$#" -ne 2 ] || ! canonical_unsigned "$1" || ! valid_sha256 "$2"; then
+  fail 'boot payload inspection output is malformed'
+fi
+PAYLOAD_SIZE=$1
+PAYLOAD_HASH=$2
+
+SECOND_SIZE=$($SYSTEM_BIN/blockdev --getsize64 "$BOOT_DEVICE" 2>/dev/null) \
+  || fail 'cannot remeasure active boot partition'
+SECOND_FULL_LINE=$(bb sha256sum "$BOOT_DEVICE" 2>/dev/null) \
+  || fail 'cannot rehash active boot partition'
+IFS=' '
+# Word splitting is intentional after pathname expansion has been disabled.
+# shellcheck disable=SC2086
+set -- $SECOND_FULL_LINE
+IFS=$OLD_IFS
+if [ "$#" -ne 2 ] || [ "$2" != "$BOOT_DEVICE" ] || ! valid_sha256 "$1"; then
+  fail 'active boot partition rehash output is malformed'
+fi
+SECOND_FULL_HASH=$1
+[ "$SECOND_SIZE" = "$FIRST_SIZE" ] && [ "$SECOND_FULL_HASH" = "$FIRST_FULL_HASH" ] \
+  || fail 'active boot partition changed during inspection'
+
+hash_installer_inputs || fail 'cannot rehash installer inputs before boot-state selection'
+[ "$INPUT_HASH" = "$PINNED_INPUT_HASH" ] \
+  || fail 'installer inputs changed before boot-state selection'
+# The single-quoted program is passed to awk; shell expansion is not intended.
+# shellcheck disable=SC2016
+BOOT_STATE=$(bb awk -F "$TAB" \
+  -v build="$BUILD_ID" \
+  -v payload_size="$PAYLOAD_SIZE" \
+  -v payload_hash="$PAYLOAD_HASH" \
+  -v partition_size="$SECOND_SIZE" \
+  -v partition_hash="$SECOND_FULL_HASH" '
+  $1 == "BOOT_STATE" && $2 == build && $4 == payload_size &&
+      $5 == payload_hash && $6 == partition_size && $7 == partition_hash {
+    matches++
+    role = $3
+  }
+  END {
+    if (matches != 1) exit 1
+    print role
+  }
+' "$INPUTS") || fail 'active boot partition and payload are not one authorized pair'
+hash_installer_inputs || fail 'cannot rehash installer inputs after boot-state selection'
+[ "$INPUT_HASH" = "$PINNED_INPUT_HASH" ] \
+  || fail 'installer inputs changed during boot-state selection'
+case "$BOOT_STATE" in
+  [a-z]* ) ;;
+  *) fail 'authorized boot state name is malformed' ;;
+esac
+case "$BOOT_STATE" in *[!a-z0-9-]*) fail 'authorized boot state name is malformed' ;; esac
+
+printf '%s\n' \
+  'INSTALL_PREFLIGHT_VERSION=1' \
+  "module_version=$MODULE_VERSION" \
+  "build_id=$BUILD_ID" \
+  "slot_suffix=$SLOT_SUFFIX" \
+  "boot_state=$BOOT_STATE" \
+  "installer_inputs_sha256=$PINNED_INPUT_HASH"
+exit 0

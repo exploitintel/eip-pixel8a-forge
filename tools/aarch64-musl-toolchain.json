@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "identity": {
+    "name": "Bootlin aarch64 musl stable 2025.08-1",
+    "release": "aarch64--musl--stable-2025.08-1",
+    "host": {
+      "os": "linux",
+      "architecture": "x86_64"
+    },
+    "target": {
+      "architecture": "aarch64",
+      "elfClass": "ELF64",
+      "elfMachine": "AArch64",
+      "toolPrefix": "aarch64-buildroot-linux-musl"
+    }
+  },
+  "archive": {
+    "name": "aarch64--musl--stable-2025.08-1.tar.xz",
+    "url": "https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/aarch64--musl--stable-2025.08-1.tar.xz",
+    "size": 81430896,
+    "sha256": "defba831ffa1175236f137069333e21ed46d4d19feb5080a90cf248b6fc2cb08",
+    "topLevelDirectory": "aarch64--musl--stable-2025.08-1"
+  },
+  "paths": {
+    "cc": "bin/aarch64-buildroot-linux-musl-gcc",
+    "readelf": "bin/aarch64-buildroot-linux-musl-readelf",
+    "sysroot": "aarch64-buildroot-linux-musl/sysroot"
+  },
+  "components": {
+    "gcc": {
+      "version": "14.3.0",
+      "license": "GPL-3.0-with-GCC-exception"
+    },
+    "binutils": {
+      "version": "2.43.1",
+      "license": "GPL-3.0-or-later AND LGPL-2.1-or-later"
+    },
+    "gdb": {
+      "version": "15.2",
+      "license": "GPL-2.0-or-later AND LGPL-2.0-or-later AND GPL-3.0-or-later AND LGPL-3.0-or-later"
+    },
+    "musl": {
+      "version": "1.2.5",
+      "license": "MIT"
+    },
+    "linuxHeaders": {
+      "version": "5.4.296",
+      "license": "GPL-2.0-only"
+    },
+    "buildroot": {
+      "version": "2021.11-18033-g83947c7bb6",
+      "license": "GPL-2.0-or-later"
+    }
+  },
+  "provenance": {
+    "vendor": "Bootlin",
+    "releasePage": "https://toolchains.bootlin.com/releases_aarch64.html",
+    "checksumUrl": "https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/aarch64--musl--stable-2025.08-1.sha256",
+    "summary": {
+      "url": "https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/summaries/aarch64--musl--stable-2025.08-1.csv",
+      "size": 6955,
+      "sha256": "1ad945d53b824b9dce029eb299060f1ca82121d2c170d90dec341ae30ff722f8"
+    },
+    "sourceRepository": "https://github.com/bootlin/buildroot-toolchains.git",
+    "sourceTag": "toolchains.bootlin.com-2025.08.1",
+    "sourceCommit": "83947c7bb6158072bc2f52b58e90891cd3dc04a2"
+  },
+  "licenses": {
+    "musl": {
+      "version": "1.2.5",
+      "spdx": "MIT",
+      "url": "https://toolchains.bootlin.com/downloads/releases/licenses/musl-1.2.5/COPYRIGHT",
+      "size": 6204,
+      "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af",
+      "archivePath": "LICENSES/musl-COPYRIGHT"
+    }
+  }
+}

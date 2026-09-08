@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "repository": "eip-pixel8a-forge",
+  "builds": [
+    {
+      "buildId": "CP2A.260805.005",
+      "status": "candidate",
+      "device": {
+        "model": "Pixel 8a",
+        "codename": "akita",
+        "buildFingerprint": "google/akita/akita:17/CP2A.260805.005/15828068:user/release-keys",
+        "buildNumber": 15828068,
+        "androidVersion": 17,
+        "securityPatch": "2026-08-05"
+      },
+      "network": {
+        "supportedEgress": ["wifi"],
+        "cellularSupported": false
+      },
+      "kernel": {
+        "upstreamCommit": "bd23337e42e794964a89f47596daf1209a25ee1a",
+        "release": "6.1.157-android14-11-gbd23337e42e7-ab14791245"
+      },
+      "boot": {
+        "partitionSize": 67108864,
+        "pageSize": 4096,
+        "headerVersion": 4,
+        "headerSize": 1584,
+        "ramdiskSize": 0,
+        "acceptedInputs": [
+          {
+            "role": "stock",
+            "payload": {
+              "size": 16606832,
+              "sha256": "6caae4112961def27eeacd6573fb2417a926db7e6619a8aec1f8c3cf70a70ade"
+            },
+            "partition": {
+              "size": 67108864,
+              "sha256": "1a425630486ddc7150ac0669d1453cb20169c3df6d7db444929eedf8645db9eb"
+            }
+          }
+        ],
+        "candidateOutputPartitionSha256": "9d2658a3a9031459e0f6627232e439861b764f47269314f46297624533220e26"
+      },
+      "kernelSuNext": {
+        "installationMode": "LKM",
+        "testedVersions": ["3.3.0"]
+      },
+      "candidateImage": {
+        "name": "Image-CP2A.260805.005.lz4",
+        "size": 16447819,
+        "sha256": "5867f1d27c3ed7f162cdab90c7e3f06277b207d5c26d4e9f481e541102b106c2"
+      }
+    }
+  ]
+}

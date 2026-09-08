@@ -1,0 +1,1489 @@
+#!/system/bin/sh
+# Filesystem-only release staging and activation primitive. The installer
+# authenticates the manifest and prepared source before invoking this helper,
+# which repeats those checks while holding the lifecycle lock.
+set -u
+
+DOCKER_ROOT=/data/docker
+PROC_ROOT=/proc
+BUSYBOX=/data/adb/ksu/bin/busybox
+
+DOCKER_PARENT=${DOCKER_ROOT%/*}
+RELEASES=$DOCKER_ROOT/releases
+RUN_ROOT=$DOCKER_ROOT/run
+KERNEL_ROOT=$DOCKER_ROOT/kernel
+CONFIG_ROOT=$DOCKER_ROOT/config
+CONFIG_FILE=$CONFIG_ROOT/host.conf
+ACTIVE_LINK=$DOCKER_ROOT/bin
+LOCK_DIR=$RUN_ROOT/host-lifecycle.lock
+LOCK_OWNER=$LOCK_DIR/pid
+LOCK_RECOVERY=$LOCK_DIR/.recovery
+BOOTSTRAP_LOCK=$DOCKER_ROOT.bootstrap.lock
+BOOTSTRAP_OWNER=$BOOTSTRAP_LOCK/pid
+BOOTSTRAP_INTENT_FILE=$BOOTSTRAP_LOCK/intent
+BOOTSTRAP_RECOVERY=$BOOTSTRAP_LOCK/.recovery
+BOOTSTRAP_HANDOFF=$DOCKER_ROOT.bootstrap.handoff
+ACTIVATION_RECORD=$RELEASES/.activation
+DEACTIVATION_RECORD=$RELEASES/.deactivation
+PROGRAM=release-transaction
+LOCK_OWNED=0
+BOOTSTRAP_OWNED=0
+BOOTSTRAP_INTENT=0
+BOOTSTRAP_DISK_INTENT=0
+BOOTSTRAP_SOURCE_PID=
+HANDOFF_ACTIVE=0
+HANDOFF_SOURCE_PID=
+TRAPS_INSTALLED=0
+TEMP_LINK=
+TEMP_RECORD=
+TEMP_DEACTIVATION=
+TEMP_MANIFEST=
+TEMP_CONFIG=
+INSTALL_ASSETS=0
+ATTENTION_STATUS=3
+
+usage() {
+  printf '%s\n' \
+    'usage: release-transaction probe' \
+    'usage: release-transaction stage-activate VERSION SOURCE MANIFEST EXPECTED_ACTIVE' \
+    '       release-transaction stage-install VERSION SOURCE MANIFEST EXPECTED_ACTIVE BUILD_ID KERNEL SIZE SHA256 DEFAULT_CONFIG CONFIG_SIZE CONFIG_SHA256' \
+    '       release-transaction deactivate EXPECTED_ACTIVE' \
+    '       release-transaction rollback EXPECTED_ACTIVE' >&2
+  exit 2
+}
+
+die() {
+  printf '%s: %s\n' "$PROGRAM" "$1" >&2
+  exit "${2:-1}"
+}
+
+bb() {
+  "$BUSYBOX" "$@"
+}
+
+path_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+sync_path() {
+  bb fsync "$1" || return 1
+}
+
+release_lock() {
+  if [ -n "$TEMP_LINK" ] && path_exists "$TEMP_LINK"; then
+    bb rm -f "$TEMP_LINK" 2>/dev/null || true
+  fi
+  TEMP_LINK=
+  if [ -n "$TEMP_RECORD" ] && path_exists "$TEMP_RECORD"; then
+    bb rm -f "$TEMP_RECORD" 2>/dev/null || true
+  fi
+  TEMP_RECORD=
+  if [ -n "$TEMP_DEACTIVATION" ] && path_exists "$TEMP_DEACTIVATION"; then
+    bb rm -f "$TEMP_DEACTIVATION" 2>/dev/null || true
+  fi
+  TEMP_DEACTIVATION=
+  if [ -n "$TEMP_MANIFEST" ] && path_exists "$TEMP_MANIFEST"; then
+    bb rm -f "$TEMP_MANIFEST" 2>/dev/null || true
+  fi
+  TEMP_MANIFEST=
+  if [ -n "$TEMP_CONFIG" ] && path_exists "$TEMP_CONFIG"; then
+    bb rm -f "$TEMP_CONFIG" 2>/dev/null || true
+  fi
+  TEMP_CONFIG=
+  if [ "$LOCK_OWNED" = 1 ] && [ "$HANDOFF_ACTIVE" = 0 ]; then
+    if [ -f "$LOCK_OWNER" ] && [ ! -L "$LOCK_OWNER" ] &&
+       [ "$(bb cat "$LOCK_OWNER" 2>/dev/null || true)" = "$$" ]; then
+      bb rm -f "$LOCK_OWNER" 2>/dev/null || true
+      bb rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+    LOCK_OWNED=0
+  fi
+
+  [ "$BOOTSTRAP_OWNED" = 1 ] || return 0
+  [ "$BOOTSTRAP_INTENT" = 0 ] || return 0
+  if [ -f "$BOOTSTRAP_OWNER" ] && [ ! -L "$BOOTSTRAP_OWNER" ] &&
+     [ "$(bb cat "$BOOTSTRAP_OWNER" 2>/dev/null || true)" = "$$" ]; then
+    bb rm -f "$BOOTSTRAP_OWNER" 2>/dev/null || true
+    bb rmdir "$BOOTSTRAP_LOCK" 2>/dev/null || true
+    sync_path "$DOCKER_PARENT" 2>/dev/null || true
+  fi
+  BOOTSTRAP_OWNED=0
+}
+
+release_for_signal() {
+  SIGNAL_STATUS=$1
+  trap - EXIT HUP INT TERM
+  release_lock
+  exit "$SIGNAL_STATUS"
+}
+
+install_traps() {
+  [ "$TRAPS_INSTALLED" = 0 ] || return 0
+  trap release_lock EXIT
+  trap 'release_for_signal 129' HUP
+  trap 'release_for_signal 130' INT
+  trap 'release_for_signal 143' TERM
+  TRAPS_INSTALLED=1
+}
+
+directory_is_safe_existing() {
+  SAFE_DIRECTORY=$1
+  [ -d "$SAFE_DIRECTORY" ] && [ ! -L "$SAFE_DIRECTORY" ] || return 1
+  [ "$(bb stat -c '%u:%g' "$SAFE_DIRECTORY" 2>/dev/null || true)" = 0:0 ] || return 1
+  SAFE_MODE=$(bb stat -c '%a' "$SAFE_DIRECTORY" 2>/dev/null) || return 1
+  case "$SAFE_MODE" in
+    [1357][0145][0145]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+require_proc_root() {
+  [ -d "$PROC_ROOT" ] && [ ! -L "$PROC_ROOT" ] \
+    || die 'process root is unavailable or unsafe'
+}
+
+require_root_layout() {
+  [ "$(bb id -u 2>/dev/null || true)" = 0 ] || die 'root is required' 2
+  directory_is_safe_existing "$DOCKER_ROOT" \
+    || die 'Docker root has unsafe type, ownership, or mode'
+  directory_is_safe_existing "$RUN_ROOT" \
+    || die 'Docker run directory has unsafe type, ownership, or mode'
+  directory_is_safe_existing "$RELEASES" \
+    || die 'Docker releases directory has unsafe type, ownership, or mode'
+}
+
+root_layout_present() {
+  path_exists "$DOCKER_ROOT" &&
+    path_exists "$RUN_ROOT" &&
+    path_exists "$RELEASES"
+}
+
+bootstrap_lock_details() {
+  BOOTSTRAP_DISK_INTENT=0
+  [ -d "$BOOTSTRAP_LOCK" ] && [ ! -L "$BOOTSTRAP_LOCK" ] || return 1
+  [ "$(bb stat -c '%u:%g' "$BOOTSTRAP_LOCK" 2>/dev/null || true)" = 0:0 ] || return 1
+  [ "$(bb stat -c '%a' "$BOOTSTRAP_LOCK" 2>/dev/null || true)" = 700 ] || return 1
+  [ -f "$BOOTSTRAP_OWNER" ] && [ ! -L "$BOOTSTRAP_OWNER" ] || return 1
+  [ "$(bb stat -c '%u:%g' "$BOOTSTRAP_OWNER" 2>/dev/null || true)" = 0:0 ] || return 1
+  [ "$(bb stat -c '%a' "$BOOTSTRAP_OWNER" 2>/dev/null || true)" = 600 ] || return 1
+  BOOTSTRAP_CONTENTS=$(bb ls -A "$BOOTSTRAP_LOCK" 2>/dev/null) || return 1
+  case "$BOOTSTRAP_CONTENTS" in
+    pid) ;;
+    "intent
+pid")
+      [ -f "$BOOTSTRAP_INTENT_FILE" ] && [ ! -L "$BOOTSTRAP_INTENT_FILE" ] || return 1
+      [ "$(bb stat -c '%u:%g' "$BOOTSTRAP_INTENT_FILE" 2>/dev/null || true)" = 0:0 ] || return 1
+      [ "$(bb stat -c '%a' "$BOOTSTRAP_INTENT_FILE" 2>/dev/null || true)" = 600 ] || return 1
+      [ "$(bb cat "$BOOTSTRAP_INTENT_FILE" 2>/dev/null || true)" = 'BOOTSTRAP_INTENT_VERSION=1' ] \
+        || return 1
+      BOOTSTRAP_DISK_INTENT=1
+      ;;
+    *) return 1 ;;
+  esac
+  BOOTSTRAP_PID=$(bb cat "$BOOTSTRAP_OWNER" 2>/dev/null) || return 1
+  case "$BOOTSTRAP_PID" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$BOOTSTRAP_PID" -gt 1 ] 2>/dev/null
+}
+
+discard_new_bootstrap_lock() {
+  bb rm -f "$BOOTSTRAP_INTENT_FILE" 2>/dev/null || true
+  bb rm -f "$BOOTSTRAP_OWNER" 2>/dev/null || true
+  bb rmdir "$BOOTSTRAP_LOCK" 2>/dev/null || true
+  sync_path "$DOCKER_PARENT" 2>/dev/null || true
+}
+
+initialize_bootstrap_lock() {
+  if ! bb chmod 0700 "$BOOTSTRAP_LOCK" || ! bb chown 0:0 "$BOOTSTRAP_LOCK" ||
+     ! (umask 077; printf '%s\n' "$$" > "$BOOTSTRAP_OWNER") ||
+     ! bb chmod 0600 "$BOOTSTRAP_OWNER" || ! bb chown 0:0 "$BOOTSTRAP_OWNER"; then
+    discard_new_bootstrap_lock
+    die 'cannot establish clean-host bootstrap lock'
+  fi
+  BOOTSTRAP_OWNED=1
+  BOOTSTRAP_INTENT=0
+  BOOTSTRAP_DISK_INTENT=0
+  install_traps
+  if ! sync_path "$BOOTSTRAP_OWNER" || ! sync_path "$BOOTSTRAP_LOCK" ||
+     ! sync_path "$DOCKER_PARENT"; then
+    die 'cannot persist clean-host bootstrap lock'
+  fi
+}
+
+acquire_bootstrap_lock() {
+  BOOTSTRAP_WAS_STALE=0
+  if (umask 077; bb mkdir "$BOOTSTRAP_LOCK" 2>/dev/null); then
+    initialize_bootstrap_lock
+    return 0
+  fi
+
+  bootstrap_lock_details || die 'bootstrap lock is malformed; refusing recovery'
+  require_proc_root
+  [ ! -d "$PROC_ROOT/$BOOTSTRAP_PID" ] || die 'another clean-host bootstrap is in progress'
+  BOOTSTRAP_SOURCE_PID=$BOOTSTRAP_PID
+  STALE_BOOTSTRAP_INTENT=$BOOTSTRAP_DISK_INTENT
+  (umask 077; bb mkdir "$BOOTSTRAP_RECOVERY" 2>/dev/null) \
+    || die 'another clean-host bootstrap claimed the stale lock'
+  if ! bb chmod 0700 "$BOOTSTRAP_RECOVERY" || ! bb chown 0:0 "$BOOTSTRAP_RECOVERY" ||
+     [ "$(bb cat "$BOOTSTRAP_OWNER" 2>/dev/null || true)" != "$BOOTSTRAP_SOURCE_PID" ] ||
+     [ -d "$PROC_ROOT/$BOOTSTRAP_SOURCE_PID" ]; then
+    bb rmdir "$BOOTSTRAP_RECOVERY" 2>/dev/null || true
+    die 'bootstrap lock changed during stale recovery'
+  fi
+  RECOVERY_BOOTSTRAP_CONTENTS=$(bb ls -A "$BOOTSTRAP_LOCK" 2>/dev/null) || {
+    bb rmdir "$BOOTSTRAP_RECOVERY" 2>/dev/null || true
+    die 'cannot re-inspect bootstrap lock during stale recovery'
+  }
+  if [ "$STALE_BOOTSTRAP_INTENT" = 1 ]; then
+    EXPECTED_BOOTSTRAP_CONTENTS=$(printf '%s\n%s\n%s\n' .recovery intent pid)
+    [ "$(bb cat "$BOOTSTRAP_INTENT_FILE" 2>/dev/null || true)" = 'BOOTSTRAP_INTENT_VERSION=1' ] || {
+      bb rmdir "$BOOTSTRAP_RECOVERY" 2>/dev/null || true
+      die 'bootstrap intent changed during stale recovery'
+    }
+  else
+    EXPECTED_BOOTSTRAP_CONTENTS=$(printf '%s\n%s\n' .recovery pid)
+  fi
+  [ "$RECOVERY_BOOTSTRAP_CONTENTS" = "$EXPECTED_BOOTSTRAP_CONTENTS" ] || {
+    bb rmdir "$BOOTSTRAP_RECOVERY" 2>/dev/null || true
+    die 'bootstrap lock changed during stale recovery'
+  }
+  (umask 077; printf '%s\n' "$$" > "$BOOTSTRAP_OWNER") || {
+    bb rmdir "$BOOTSTRAP_RECOVERY" 2>/dev/null || true
+    die 'cannot claim proved-stale bootstrap lock'
+  }
+  if ! bb chmod 0600 "$BOOTSTRAP_OWNER" || ! bb chown 0:0 "$BOOTSTRAP_OWNER" ||
+     ! sync_path "$BOOTSTRAP_OWNER" || ! bb rmdir "$BOOTSTRAP_RECOVERY" ||
+     ! sync_path "$BOOTSTRAP_LOCK" || ! sync_path "$DOCKER_PARENT"; then
+    die 'cannot persist proved-stale bootstrap lock claim'
+  fi
+  BOOTSTRAP_WAS_STALE=1
+  BOOTSTRAP_OWNED=1
+  BOOTSTRAP_INTENT=$STALE_BOOTSTRAP_INTENT
+  BOOTSTRAP_DISK_INTENT=$STALE_BOOTSTRAP_INTENT
+  install_traps
+}
+
+persist_bootstrap_intent() {
+  [ "$BOOTSTRAP_OWNED" = 1 ] && [ "$BOOTSTRAP_INTENT" = 0 ] || return 1
+  BOOTSTRAP_INTENT=1
+  (umask 077; printf '%s\n' 'BOOTSTRAP_INTENT_VERSION=1' > "$BOOTSTRAP_INTENT_FILE") \
+    || die 'cannot record clean-host bootstrap intent'
+  if ! bb chmod 0600 "$BOOTSTRAP_INTENT_FILE" || ! bb chown 0:0 "$BOOTSTRAP_INTENT_FILE" ||
+     ! sync_path "$BOOTSTRAP_INTENT_FILE" || ! sync_path "$BOOTSTRAP_LOCK" ||
+     ! sync_path "$DOCKER_PARENT"; then
+    die 'cannot persist clean-host bootstrap intent'
+  fi
+  BOOTSTRAP_DISK_INTENT=1
+}
+
+validate_partial_bootstrap_layout() {
+  EXPECTED_PARTIAL_LOCK_PID=${1:-}
+  PARTIAL_LOCK_STATE=${2:-stale}
+  PARTIAL_LOCK_PID=
+  path_exists "$DOCKER_ROOT" || return 0
+  [ -d "$DOCKER_ROOT" ] && [ ! -L "$DOCKER_ROOT" ] ||
+    die 'partial bootstrap Docker root is not a real directory'
+  [ "$(bb stat -c '%u:%g' "$DOCKER_ROOT" 2>/dev/null || true)" = 0:0 ] &&
+    [ "$(bb stat -c '%a' "$DOCKER_ROOT" 2>/dev/null || true)" = 700 ] ||
+    die 'partial bootstrap Docker root has unsafe ownership or mode'
+  for BOOTSTRAP_MEMBER in "$DOCKER_ROOT"/* "$DOCKER_ROOT"/.[!.]* "$DOCKER_ROOT"/..?*; do
+    path_exists "$BOOTSTRAP_MEMBER" || continue
+    BOOTSTRAP_NAME=${BOOTSTRAP_MEMBER##*/}
+    case "$BOOTSTRAP_NAME" in run|releases) ;; *)
+      die 'partial bootstrap Docker root contains unexpected state' ;;
+    esac
+    [ -d "$BOOTSTRAP_MEMBER" ] && [ ! -L "$BOOTSTRAP_MEMBER" ] &&
+      [ "$(bb stat -c '%u:%g' "$BOOTSTRAP_MEMBER" 2>/dev/null || true)" = 0:0 ] &&
+      [ "$(bb stat -c '%a' "$BOOTSTRAP_MEMBER" 2>/dev/null || true)" = 700 ] ||
+      die 'partial bootstrap directory has unsafe type, ownership, or mode'
+  done
+
+  if path_exists "$RELEASES"; then
+    PARTIAL_RELEASE_CONTENTS=$(bb ls -A "$RELEASES" 2>/dev/null) \
+      || die 'cannot inspect partial bootstrap releases directory'
+    [ -z "$PARTIAL_RELEASE_CONTENTS" ] \
+      || die 'partial bootstrap releases directory is not empty'
+  fi
+  if ! path_exists "$RUN_ROOT"; then
+    [ -z "$EXPECTED_PARTIAL_LOCK_PID" ] ||
+      die 'partial bootstrap lifecycle lock is missing'
+    return 0
+  fi
+  for RUN_MEMBER in "$RUN_ROOT"/* "$RUN_ROOT"/.[!.]* "$RUN_ROOT"/..?*; do
+    path_exists "$RUN_MEMBER" || continue
+    [ "${RUN_MEMBER##*/}" = host-lifecycle.lock ] \
+      || die 'partial bootstrap run directory contains unexpected state'
+  done
+  if ! path_exists "$LOCK_DIR"; then
+    [ -z "$EXPECTED_PARTIAL_LOCK_PID" ] ||
+      die 'partial bootstrap lifecycle lock is missing'
+    return 0
+  fi
+  [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ] &&
+    [ "$(bb stat -c '%u:%g' "$LOCK_DIR" 2>/dev/null || true)" = 0:0 ] &&
+    [ "$(bb stat -c '%a' "$LOCK_DIR" 2>/dev/null || true)" = 700 ] \
+    || die 'partial bootstrap lifecycle lock is unsafe'
+  [ -f "$LOCK_OWNER" ] && [ ! -L "$LOCK_OWNER" ] &&
+    [ "$(bb stat -c '%u:%g' "$LOCK_OWNER" 2>/dev/null || true)" = 0:0 ] &&
+    [ "$(bb stat -c '%a' "$LOCK_OWNER" 2>/dev/null || true)" = 600 ] &&
+    [ "$(bb ls -A "$LOCK_DIR" 2>/dev/null || true)" = pid ] \
+    || die 'partial bootstrap lifecycle lock owner is unsafe'
+  PARTIAL_LOCK_PID=$(bb cat "$LOCK_OWNER" 2>/dev/null) \
+    || die 'cannot read partial bootstrap lifecycle lock owner'
+  case "$PARTIAL_LOCK_PID" in
+    ''|*[!0-9]*) die 'partial bootstrap lifecycle lock owner is malformed' ;;
+  esac
+  [ "$PARTIAL_LOCK_PID" -gt 1 ] 2>/dev/null \
+    || die 'partial bootstrap lifecycle lock owner is malformed'
+  if [ -n "$EXPECTED_PARTIAL_LOCK_PID" ] &&
+     [ "$PARTIAL_LOCK_PID" != "$EXPECTED_PARTIAL_LOCK_PID" ]; then
+    die 'partial bootstrap lifecycle lock owner changed'
+  fi
+  require_proc_root
+  case "$PARTIAL_LOCK_STATE" in
+    stale)
+      [ ! -d "$PROC_ROOT/$PARTIAL_LOCK_PID" ] \
+        || die 'partial bootstrap lifecycle lock is still live'
+      ;;
+    owned)
+      [ -n "$EXPECTED_PARTIAL_LOCK_PID" ] && [ "$PARTIAL_LOCK_PID" = "$$" ] \
+        || die 'partial bootstrap lifecycle lock is not owned by this transaction'
+      ;;
+    *) die 'invalid partial bootstrap lifecycle lock state' ;;
+  esac
+}
+
+handoff_marker_details() {
+  [ -f "$BOOTSTRAP_HANDOFF" ] && [ ! -L "$BOOTSTRAP_HANDOFF" ] || return 1
+  [ "$(bb stat -c '%u:%g' "$BOOTSTRAP_HANDOFF" 2>/dev/null || true)" = 0:0 ] || return 1
+  [ "$(bb stat -c '%a' "$BOOTSTRAP_HANDOFF" 2>/dev/null || true)" = 600 ] || return 1
+  [ "$(bb cat "$BOOTSTRAP_HANDOFF" 2>/dev/null || true)" = 'BOOTSTRAP_INTENT_VERSION=1' ] \
+    || return 1
+  HANDOFF_MARKER_ID=$(bb stat -c '%d:%i' "$BOOTSTRAP_HANDOFF" 2>/dev/null) || return 1
+  [ -n "$HANDOFF_MARKER_ID" ]
+}
+
+validate_handoff_bootstrap_remnant() {
+  HANDOFF_EXPECTED_PID=$1
+  path_exists "$BOOTSTRAP_LOCK" || return 0
+  [ -d "$BOOTSTRAP_LOCK" ] && [ ! -L "$BOOTSTRAP_LOCK" ] &&
+    [ "$(bb stat -c '%u:%g' "$BOOTSTRAP_LOCK" 2>/dev/null || true)" = 0:0 ] &&
+    [ "$(bb stat -c '%a' "$BOOTSTRAP_LOCK" 2>/dev/null || true)" = 700 ] \
+    || die 'bootstrap handoff lock is unsafe'
+  HANDOFF_BOOTSTRAP_CONTENTS=$(bb ls -A "$BOOTSTRAP_LOCK" 2>/dev/null) \
+    || die 'cannot inspect bootstrap handoff lock'
+  case "$HANDOFF_BOOTSTRAP_CONTENTS" in
+    '') ;;
+    pid)
+      [ -f "$BOOTSTRAP_OWNER" ] && [ ! -L "$BOOTSTRAP_OWNER" ] &&
+        [ "$(bb stat -c '%u:%g' "$BOOTSTRAP_OWNER" 2>/dev/null || true)" = 0:0 ] &&
+        [ "$(bb stat -c '%a' "$BOOTSTRAP_OWNER" 2>/dev/null || true)" = 600 ] &&
+        [ "$(bb cat "$BOOTSTRAP_OWNER" 2>/dev/null || true)" = "$HANDOFF_EXPECTED_PID" ] \
+        || die 'bootstrap handoff owner is unsafe or changed'
+      ;;
+    "intent
+pid")
+      [ -f "$BOOTSTRAP_INTENT_FILE" ] && [ ! -L "$BOOTSTRAP_INTENT_FILE" ] &&
+        [ "$(bb stat -c '%u:%g' "$BOOTSTRAP_INTENT_FILE" 2>/dev/null || true)" = 0:0 ] &&
+        [ "$(bb stat -c '%a' "$BOOTSTRAP_INTENT_FILE" 2>/dev/null || true)" = 600 ] &&
+        [ "$(bb cat "$BOOTSTRAP_INTENT_FILE" 2>/dev/null || true)" = 'BOOTSTRAP_INTENT_VERSION=1' ] &&
+        [ "$(bb stat -c '%d:%i' "$BOOTSTRAP_INTENT_FILE" 2>/dev/null || true)" = "$HANDOFF_MARKER_ID" ] \
+        || die 'bootstrap handoff intent is unsafe or changed'
+      [ -f "$BOOTSTRAP_OWNER" ] && [ ! -L "$BOOTSTRAP_OWNER" ] &&
+        [ "$(bb stat -c '%u:%g' "$BOOTSTRAP_OWNER" 2>/dev/null || true)" = 0:0 ] &&
+        [ "$(bb stat -c '%a' "$BOOTSTRAP_OWNER" 2>/dev/null || true)" = 600 ] &&
+        [ "$(bb cat "$BOOTSTRAP_OWNER" 2>/dev/null || true)" = "$HANDOFF_EXPECTED_PID" ] \
+        || die 'bootstrap handoff owner is unsafe or changed'
+      ;;
+    *) die 'bootstrap handoff lock contains unexpected state' ;;
+  esac
+}
+
+inspect_bootstrap_handoff() {
+  handoff_marker_details || die 'bootstrap handoff marker is malformed or unsafe'
+  INSPECTED_HANDOFF_ID=$HANDOFF_MARKER_ID
+  validate_partial_bootstrap_layout
+  [ -n "$PARTIAL_LOCK_PID" ] || die 'bootstrap handoff has no lifecycle owner'
+  HANDOFF_SOURCE_PID=$PARTIAL_LOCK_PID
+  validate_handoff_bootstrap_remnant "$HANDOFF_SOURCE_PID"
+  require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+}
+
+recover_bootstrap_handoff() {
+  inspect_bootstrap_handoff
+  RECOVERY_HANDOFF_ID=$INSPECTED_HANDOFF_ID
+  RECOVERY_HANDOFF_SOURCE_PID=$HANDOFF_SOURCE_PID
+  HANDOFF_ACTIVE=1
+  acquire_lock
+  handoff_marker_details || die 'bootstrap handoff marker changed during recovery'
+  [ "$HANDOFF_MARKER_ID" = "$RECOVERY_HANDOFF_ID" ] \
+    || die 'bootstrap handoff marker changed during recovery'
+  [ ! -d "$PROC_ROOT/$RECOVERY_HANDOFF_SOURCE_PID" ] \
+    || die 'bootstrap handoff source became live during recovery'
+  validate_partial_bootstrap_layout "$$" owned
+  validate_handoff_bootstrap_remnant "$RECOVERY_HANDOFF_SOURCE_PID"
+  if path_exists "$BOOTSTRAP_LOCK"; then
+    if path_exists "$BOOTSTRAP_INTENT_FILE"; then
+      bb rm -f "$BOOTSTRAP_INTENT_FILE" ||
+        die 'cannot remove recovered bootstrap handoff intent'
+      sync_path "$BOOTSTRAP_LOCK" ||
+        die 'cannot persist recovered bootstrap handoff intent removal'
+    fi
+    if path_exists "$BOOTSTRAP_OWNER"; then
+      bb rm -f "$BOOTSTRAP_OWNER" ||
+        die 'cannot remove recovered bootstrap handoff owner'
+      sync_path "$BOOTSTRAP_LOCK" ||
+        die 'cannot persist recovered bootstrap handoff owner removal'
+    fi
+    bb rmdir "$BOOTSTRAP_LOCK" || die 'cannot remove recovered bootstrap handoff lock'
+    sync_path "$DOCKER_PARENT" || die 'cannot persist recovered bootstrap lock removal'
+  fi
+  bb rm -f "$BOOTSTRAP_HANDOFF" || die 'cannot remove recovered bootstrap handoff marker'
+  sync_path "$DOCKER_PARENT" || die 'cannot persist recovered bootstrap handoff completion'
+  HANDOFF_ACTIVE=0
+}
+
+create_bootstrap_directory() {
+  CREATE_PATH=$1
+  CREATE_PARENT=$2
+  CREATE_LABEL=$3
+  (umask 077; bb mkdir "$CREATE_PATH") || die "cannot create $CREATE_LABEL"
+  if ! bb chmod 0700 "$CREATE_PATH" || ! bb chown 0:0 "$CREATE_PATH"; then
+    die "cannot protect $CREATE_LABEL"
+  fi
+  [ -d "$CREATE_PATH" ] && [ ! -L "$CREATE_PATH" ] &&
+    [ "$(bb stat -c '%u:%g' "$CREATE_PATH" 2>/dev/null || true)" = 0:0 ] &&
+    [ "$(bb stat -c '%a' "$CREATE_PATH" 2>/dev/null || true)" = 700 ] ||
+    die "cannot verify $CREATE_LABEL"
+  if ! sync_path "$CREATE_PATH" || ! sync_path "$CREATE_PARENT"; then
+    die "cannot fsync $CREATE_LABEL"
+  fi
+}
+
+finish_bootstrap_handoff() {
+  [ "$LOCK_OWNED" = 1 ] && [ "$BOOTSTRAP_OWNED" = 1 ] || return 1
+  [ -f "$BOOTSTRAP_OWNER" ] && [ ! -L "$BOOTSTRAP_OWNER" ] &&
+    [ "$(bb cat "$BOOTSTRAP_OWNER" 2>/dev/null || true)" = "$$" ] || return 1
+  [ -f "$BOOTSTRAP_INTENT_FILE" ] && [ ! -L "$BOOTSTRAP_INTENT_FILE" ] || return 1
+  [ "$(bb cat "$BOOTSTRAP_INTENT_FILE" 2>/dev/null || true)" = 'BOOTSTRAP_INTENT_VERSION=1' ] \
+    || return 1
+  ! path_exists "$BOOTSTRAP_HANDOFF" || return 1
+  HANDOFF_ACTIVE=1
+  bb ln "$BOOTSTRAP_INTENT_FILE" "$BOOTSTRAP_HANDOFF" || return 1
+  sync_path "$DOCKER_PARENT" || return 1
+  bb rm -f "$BOOTSTRAP_INTENT_FILE" || return 1
+  sync_path "$BOOTSTRAP_LOCK" || return 1
+  bb rm -f "$BOOTSTRAP_OWNER" || return 1
+  sync_path "$BOOTSTRAP_LOCK" || return 1
+  bb rmdir "$BOOTSTRAP_LOCK" || return 1
+  BOOTSTRAP_OWNED=0
+  BOOTSTRAP_INTENT=0
+  sync_path "$DOCKER_PARENT" || return 1
+  bb rm -f "$BOOTSTRAP_HANDOFF" || return 1
+  sync_path "$DOCKER_PARENT" || return 1
+  HANDOFF_ACTIVE=0
+}
+
+prepare_stage_layout() {
+  if path_exists "$BOOTSTRAP_HANDOFF"; then
+    recover_bootstrap_handoff
+    require_root_layout
+    return 0
+  fi
+  if ! path_exists "$BOOTSTRAP_LOCK" && root_layout_present; then
+    require_root_layout
+    acquire_lock
+    return 0
+  fi
+  if ! path_exists "$BOOTSTRAP_LOCK" && path_exists "$DOCKER_ROOT"; then
+    die 'incomplete Docker root has no durable bootstrap intent; refusing recovery'
+  fi
+
+  [ "$(bb id -u 2>/dev/null || true)" = 0 ] || die 'root is required' 2
+  [ -d "$DOCKER_PARENT" ] && [ ! -L "$DOCKER_PARENT" ] ||
+    die 'Docker parent must be a real directory'
+  acquire_bootstrap_lock
+  if [ "$BOOTSTRAP_WAS_STALE" = 0 ] && path_exists "$DOCKER_ROOT"; then
+    die 'Docker root appeared while clean-host bootstrap lock was acquired'
+  fi
+  if path_exists "$DOCKER_ROOT" && [ "$BOOTSTRAP_DISK_INTENT" != 1 ]; then
+    die 'partial Docker root has no persisted bootstrap intent; refusing recovery'
+  fi
+  if ! path_exists "$DOCKER_ROOT" && [ "$BOOTSTRAP_DISK_INTENT" != 1 ]; then
+    persist_bootstrap_intent
+  fi
+  validate_partial_bootstrap_layout
+  path_exists "$DOCKER_ROOT" ||
+    create_bootstrap_directory "$DOCKER_ROOT" "$DOCKER_PARENT" 'Docker root'
+  path_exists "$RUN_ROOT" ||
+    create_bootstrap_directory "$RUN_ROOT" "$DOCKER_ROOT" 'Docker run directory'
+  acquire_lock
+  path_exists "$RELEASES" ||
+    create_bootstrap_directory "$RELEASES" "$DOCKER_ROOT" 'Docker releases directory'
+  require_root_layout
+  finish_bootstrap_handoff || die 'cannot complete clean-host bootstrap lock handoff'
+}
+
+acquire_lock() {
+  if ! bb mkdir "$LOCK_DIR" 2>/dev/null; then
+    [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ] \
+      || die 'lifecycle lock is ambiguous; refusing recovery'
+    [ "$(bb stat -c '%u:%g' "$LOCK_DIR" 2>/dev/null || true)" = 0:0 ] &&
+      [ "$(bb stat -c '%a' "$LOCK_DIR" 2>/dev/null || true)" = 700 ] \
+      || die 'lifecycle lock metadata is unsafe; refusing recovery'
+    [ -f "$LOCK_OWNER" ] && [ ! -L "$LOCK_OWNER" ] \
+      || die 'lifecycle lock owner is malformed; refusing recovery'
+    [ "$(bb stat -c '%u:%g' "$LOCK_OWNER" 2>/dev/null || true)" = 0:0 ] &&
+      [ "$(bb stat -c '%a' "$LOCK_OWNER" 2>/dev/null || true)" = 600 ] \
+      || die 'lifecycle lock owner metadata is unsafe; refusing recovery'
+    LOCK_PID=$(bb cat "$LOCK_OWNER" 2>/dev/null) \
+      || die 'cannot read lifecycle lock owner'
+    case "$LOCK_PID" in
+      ''|*[!0-9]*) die 'lifecycle lock owner is malformed; refusing recovery' ;;
+    esac
+    [ "$LOCK_PID" -gt 1 ] 2>/dev/null \
+      || die 'lifecycle lock owner is malformed; refusing recovery'
+    LOCK_CONTENTS=$(bb ls -A "$LOCK_DIR" 2>/dev/null) \
+      || die 'cannot inspect lifecycle lock'
+    [ "$LOCK_CONTENTS" = pid ] \
+      || die 'lifecycle lock contains unexpected state; refusing recovery'
+    require_proc_root
+    [ ! -d "$PROC_ROOT/$LOCK_PID" ] \
+      || die 'another lifecycle operation is in progress'
+    STALE_LOCK_PID=$LOCK_PID
+    (umask 077; bb mkdir "$LOCK_RECOVERY" 2>/dev/null) \
+      || die 'another lifecycle operation is recovering the stale lock'
+    if ! bb chmod 0700 "$LOCK_RECOVERY" || ! bb chown 0:0 "$LOCK_RECOVERY" ||
+       [ "$(bb cat "$LOCK_OWNER" 2>/dev/null || true)" != "$STALE_LOCK_PID" ] ||
+       [ -d "$PROC_ROOT/$STALE_LOCK_PID" ]; then
+      bb rmdir "$LOCK_RECOVERY" 2>/dev/null || true
+      die 'lifecycle lock changed during stale recovery'
+    fi
+    RECOVERY_LOCK_CONTENTS=$(bb ls -A "$LOCK_DIR" 2>/dev/null) || {
+      bb rmdir "$LOCK_RECOVERY" 2>/dev/null || true
+      die 'cannot re-inspect lifecycle lock during stale recovery'
+    }
+    EXPECTED_RECOVERY_LOCK_CONTENTS=$(printf '%s\n%s\n' .recovery pid)
+    [ "$RECOVERY_LOCK_CONTENTS" = "$EXPECTED_RECOVERY_LOCK_CONTENTS" ] || {
+      bb rmdir "$LOCK_RECOVERY" 2>/dev/null || true
+      die 'lifecycle lock changed during stale recovery'
+    }
+    (umask 077; printf '%s\n' "$$" > "$LOCK_OWNER") || {
+      bb rmdir "$LOCK_RECOVERY" 2>/dev/null || true
+      die 'cannot claim proved-stale lifecycle lock'
+    }
+    if ! bb chmod 0600 "$LOCK_OWNER" || ! bb chown 0:0 "$LOCK_OWNER" ||
+       ! sync_path "$LOCK_OWNER" || ! bb rmdir "$LOCK_RECOVERY" || ! sync_path "$LOCK_DIR"; then
+      die 'cannot persist proved-stale lifecycle lock claim'
+    fi
+  fi
+  bb chmod 0700 "$LOCK_DIR" || {
+    bb rmdir "$LOCK_DIR" 2>/dev/null || true
+    die 'cannot protect lifecycle lock'
+  }
+  bb chown 0:0 "$LOCK_DIR" || {
+    bb rmdir "$LOCK_DIR" 2>/dev/null || true
+    die 'cannot own lifecycle lock'
+  }
+  (umask 077; printf '%s\n' "$$" > "$LOCK_OWNER") || {
+    bb rmdir "$LOCK_DIR" 2>/dev/null || true
+    die 'cannot record lifecycle lock owner'
+  }
+  if ! bb chmod 0600 "$LOCK_OWNER" || ! bb chown 0:0 "$LOCK_OWNER"; then
+    bb rm -f "$LOCK_OWNER" 2>/dev/null || true
+    bb rmdir "$LOCK_DIR" 2>/dev/null || true
+    die 'cannot protect lifecycle lock owner'
+  fi
+  LOCK_OWNED=1
+  install_traps
+}
+
+validate_release_name() {
+  VALIDATE_NAME=$1
+  case "$VALIDATE_NAME" in
+    ''|none|.*|*/*|*[!A-Za-z0-9._+-]*|*.staging) return 1 ;;
+  esac
+  [ "${#VALIDATE_NAME}" -le 96 ]
+}
+
+validate_build_id() {
+  case "$1" in
+    ''|.*|*.|*..*|*[!A-Z0-9.]*) return 1 ;;
+  esac
+}
+
+valid_sha256() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+canonical_positive() {
+  case "$1" in [1-9]*) ;; *) return 1 ;; esac
+  case "$1" in *[!0-9]*) return 1 ;; esac
+}
+
+require_runtime_members() {
+  REQUIRED_SEEN=$1
+  for REQUIRED_NAME in \
+    buildkit-runc.sh containerd containerd-shim-runc-v2 ctr docker docker-init \
+    docker-proxy dockerd dockerd.sh hostctl privns route-policy runc
+  do
+    case "$REQUIRED_SEEN" in
+      *"|$REQUIRED_NAME|"*) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+validate_manifest() {
+  VALIDATE_MANIFEST=$1
+  [ -f "$VALIDATE_MANIFEST" ] && [ ! -L "$VALIDATE_MANIFEST" ] \
+    || die 'release manifest must be a regular file'
+  MANIFEST_COUNT=0
+  MANIFEST_SEEN='|'
+  TAB=$(printf '\t')
+  {
+    IFS= read -r MANIFEST_HEADER || die 'release manifest is empty'
+    [ "$MANIFEST_HEADER" = 'RELEASE_MANIFEST_VERSION=1' ] \
+      || die 'release manifest has an unsupported header'
+    while IFS="$TAB" read -r MANIFEST_NAME MANIFEST_SIZE MANIFEST_HASH MANIFEST_MODE MANIFEST_EXTRA
+    do
+      [ -n "$MANIFEST_NAME" ] || die 'release manifest contains a blank or malformed row'
+      [ -z "${MANIFEST_EXTRA:-}" ] \
+        || die "release manifest row has extra fields: $MANIFEST_NAME"
+      case "$MANIFEST_NAME" in
+        .*|*/*|*[!A-Za-z0-9._+-]*) die "unsafe release manifest name: $MANIFEST_NAME" ;;
+      esac
+      case "$MANIFEST_COUNT:$MANIFEST_NAME" in
+        0:buildkit-runc.sh|1:containerd|2:containerd-shim-runc-v2|3:ctr|4:docker|\
+        5:docker-init|6:docker-proxy|7:dockerd|8:dockerd.sh|9:hostctl|10:privns|\
+        11:route-policy|12:runc) ;;
+        *) die "release manifest rows are not in canonical order: $MANIFEST_NAME" ;;
+      esac
+      case "$MANIFEST_SEEN" in
+        *"|$MANIFEST_NAME|"*) die "duplicate release manifest name: $MANIFEST_NAME" ;;
+      esac
+      case "$MANIFEST_SIZE" in
+        ''|*[!0-9]*) die "invalid release manifest size: $MANIFEST_NAME" ;;
+        0|[1-9]*) ;;
+        *) die "invalid release manifest size: $MANIFEST_NAME" ;;
+      esac
+      [ "${#MANIFEST_HASH}" -eq 64 ] || die "invalid release manifest hash: $MANIFEST_NAME"
+      case "$MANIFEST_HASH" in *[!0-9a-f]*) die "invalid release manifest hash: $MANIFEST_NAME" ;; esac
+      case "$MANIFEST_MODE" in 0755) ;; *) die "required runtime member is not executable: $MANIFEST_NAME" ;; esac
+      MANIFEST_SEEN=$MANIFEST_SEEN$MANIFEST_NAME'|'
+      MANIFEST_COUNT=$((MANIFEST_COUNT + 1))
+    done
+  } < "$VALIDATE_MANIFEST"
+  [ "$MANIFEST_COUNT" -gt 0 ] || die 'release manifest has no members'
+  require_runtime_members "$MANIFEST_SEEN" \
+    || die 'release manifest omits a required runtime member'
+  [ "$MANIFEST_COUNT" -eq 13 ] || die 'release manifest must contain exactly 13 runtime members'
+}
+
+file_hash() {
+  HASH_LINE=$(bb sha256sum "$1" 2>/dev/null) || return 1
+  FILE_HASH=${HASH_LINE%% *}
+  [ "${#FILE_HASH}" -eq 64 ] || return 1
+  case "$FILE_HASH" in *[!0-9a-f]*) return 1 ;; esac
+  return 0
+}
+
+verify_manifest_file() {
+  VERIFY_FILE=$1
+  VERIFY_SIZE=$2
+  VERIFY_HASH=$3
+  VERIFY_MODE=$4
+  [ -f "$VERIFY_FILE" ] && [ ! -L "$VERIFY_FILE" ] || return 1
+  [ "$(bb stat -c '%s' "$VERIFY_FILE" 2>/dev/null || true)" = "$VERIFY_SIZE" ] \
+    || return 1
+  ACTUAL_MODE=$(bb stat -c '%a' "$VERIFY_FILE" 2>/dev/null) || return 1
+  [ "0$ACTUAL_MODE" = "$VERIFY_MODE" ] || return 1
+  file_hash "$VERIFY_FILE" || return 1
+  [ "$FILE_HASH" = "$VERIFY_HASH" ]
+}
+
+walk_manifest() {
+  WALK_ACTION=$1
+  WALK_ROOT=$2
+  WALK_MANIFEST=$3
+  TAB=$(printf '\t')
+  {
+    IFS= read -r WALK_HEADER || return 1
+    [ "$WALK_HEADER" = 'RELEASE_MANIFEST_VERSION=1' ] || return 1
+    while IFS="$TAB" read -r WALK_NAME WALK_SIZE WALK_HASH WALK_MODE WALK_EXTRA
+    do
+      [ -n "$WALK_NAME" ] && [ -z "${WALK_EXTRA:-}" ] || return 1
+      case "$WALK_ACTION" in
+        verify)
+          verify_manifest_file "$WALK_ROOT/$WALK_NAME" "$WALK_SIZE" "$WALK_HASH" "$WALK_MODE" || return 1
+          ;;
+        verify-owned)
+          verify_manifest_file "$WALK_ROOT/$WALK_NAME" "$WALK_SIZE" "$WALK_HASH" "$WALK_MODE" || return 1
+          [ "$(bb stat -c '%u:%g' "$WALK_ROOT/$WALK_NAME" 2>/dev/null || true)" = 0:0 ] || return 1
+          ;;
+        copy)
+          verify_manifest_file "$SOURCE_ROOT/$WALK_NAME" "$WALK_SIZE" "$WALK_HASH" "$WALK_MODE" || return 1
+          bb cp "$SOURCE_ROOT/$WALK_NAME" "$WALK_ROOT/$WALK_NAME" || return 1
+          bb chown 0:0 "$WALK_ROOT/$WALK_NAME" || return 1
+          bb chmod "$WALK_MODE" "$WALK_ROOT/$WALK_NAME" || return 1
+          verify_manifest_file "$WALK_ROOT/$WALK_NAME" "$WALK_SIZE" "$WALK_HASH" "$WALK_MODE" || return 1
+          [ "$(bb stat -c '%u:%g' "$WALK_ROOT/$WALK_NAME" 2>/dev/null || true)" = 0:0 ] || return 1
+          sync_path "$WALK_ROOT/$WALK_NAME" || return 1
+          ;;
+        *) return 1 ;;
+      esac
+    done
+  } < "$WALK_MANIFEST"
+  return 0
+}
+
+verify_tree() {
+  VERIFY_ROOT=$1
+  VERIFY_MANIFEST=$2
+  [ -d "$VERIFY_ROOT" ] && [ ! -L "$VERIFY_ROOT" ] || return 1
+  [ "$(bb stat -c '%u:%g' "$VERIFY_ROOT" 2>/dev/null || true)" = 0:0 ] || return 1
+  TREE_COUNT=0
+  for TREE_MEMBER in "$VERIFY_ROOT"/* "$VERIFY_ROOT"/.[!.]* "$VERIFY_ROOT"/..?*; do
+    path_exists "$TREE_MEMBER" || continue
+    TREE_NAME=${TREE_MEMBER##*/}
+    if [ "$TREE_NAME" = .release-manifest.tsv ]; then
+      TREE_COUNT=$((TREE_COUNT + 1))
+      continue
+    fi
+    case "$TREE_NAME" in .*|*/*|*[!A-Za-z0-9._+-]*) return 1 ;; esac
+    case "$MANIFEST_SEEN" in *"|$TREE_NAME|"*) ;; *) return 1 ;; esac
+    TREE_COUNT=$((TREE_COUNT + 1))
+  done
+  [ "$TREE_COUNT" -eq $((MANIFEST_COUNT + 1)) ] || return 1
+  [ -f "$VERIFY_ROOT/.release-manifest.tsv" ] && [ ! -L "$VERIFY_ROOT/.release-manifest.tsv" ] \
+    || return 1
+  [ "$(bb stat -c '%a' "$VERIFY_ROOT/.release-manifest.tsv" 2>/dev/null || true)" = 600 ] \
+    || return 1
+  [ "$(bb stat -c '%u:%g' "$VERIFY_ROOT/.release-manifest.tsv" 2>/dev/null || true)" = 0:0 ] \
+    || return 1
+  walk_manifest verify-owned "$VERIFY_ROOT" "$VERIFY_MANIFEST"
+}
+
+verify_source() {
+  SOURCE_ROOT=$1
+  SOURCE_MANIFEST=$2
+  [ -d "$SOURCE_ROOT" ] && [ ! -L "$SOURCE_ROOT" ] \
+    || die 'prepared release source must be a real directory'
+  SOURCE_COUNT=0
+  for SOURCE_MEMBER in "$SOURCE_ROOT"/* "$SOURCE_ROOT"/.[!.]* "$SOURCE_ROOT"/..?*; do
+    path_exists "$SOURCE_MEMBER" || continue
+    SOURCE_NAME=${SOURCE_MEMBER##*/}
+    case "$SOURCE_NAME" in .*|*/*|*[!A-Za-z0-9._+-]*) \
+      die 'prepared release source contains an unsafe member' ;; esac
+    case "$MANIFEST_SEEN" in *"|$SOURCE_NAME|"*) ;; *) \
+      die 'prepared release source contains an unmanifested member' ;; esac
+    SOURCE_COUNT=$((SOURCE_COUNT + 1))
+  done
+  [ "$SOURCE_COUNT" -eq "$MANIFEST_COUNT" ] \
+    || die 'prepared release source does not exactly match its manifest'
+  walk_manifest verify "$SOURCE_ROOT" "$SOURCE_MANIFEST" \
+    || die 'prepared release source does not match its manifest'
+}
+
+require_exact_private_directory() {
+  PRIVATE_DIRECTORY=$1
+  [ -d "$PRIVATE_DIRECTORY" ] && [ ! -L "$PRIVATE_DIRECTORY" ] || return 1
+  [ "$(bb stat -c '%u:%g' "$PRIVATE_DIRECTORY" 2>/dev/null || true)" = 0:0 ] || return 1
+  [ "$(bb stat -c '%a' "$PRIVATE_DIRECTORY" 2>/dev/null || true)" = 700 ]
+}
+
+ensure_private_directory() {
+  ENSURE_DIRECTORY=$1
+  ENSURE_PARENT=$2
+  ENSURE_LABEL=$3
+  if ! path_exists "$ENSURE_DIRECTORY"; then
+    create_bootstrap_directory "$ENSURE_DIRECTORY" "$ENSURE_PARENT" "$ENSURE_LABEL"
+  fi
+  require_exact_private_directory "$ENSURE_DIRECTORY" \
+    || die "$ENSURE_LABEL has unsafe type, ownership, or mode"
+}
+
+verify_kernel_tree() {
+  VERIFY_KERNEL_ROOT=$1
+  require_exact_private_directory "$VERIFY_KERNEL_ROOT" || return 1
+  [ "$(bb ls -A "$VERIFY_KERNEL_ROOT" 2>/dev/null || true)" = Image.lz4 ] || return 1
+  verify_manifest_file "$VERIFY_KERNEL_ROOT/Image.lz4" \
+    "$INSTALL_KERNEL_SIZE" "$INSTALL_KERNEL_HASH" 0600 || return 1
+  [ "$(bb stat -c '%u:%g' "$VERIFY_KERNEL_ROOT/Image.lz4" 2>/dev/null || true)" = 0:0 ]
+}
+
+validate_existing_host_config() {
+  path_exists "$CONFIG_FILE" || return 0
+  [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] \
+    && [ "$(bb stat -c '%u:%g' "$CONFIG_FILE" 2>/dev/null || true)" = 0:0 ] \
+    && [ "$(bb stat -c '%a' "$CONFIG_FILE" 2>/dev/null || true)" = 600 ] \
+    || return 1
+  bb awk -F= '
+    function valid_size(value) {
+      if (value == "0") return 1
+      if (value !~ /^[1-9][0-9]*$/ || length(value) > 13) return 0
+      return value >= 268435456 && value <= 1099511627776 && value % 4096 == 0
+    }
+    function valid_cidr(value, pair, octet, prefix, address, block, end, i) {
+      if (split(value, pair, "/") != 2 || pair[2] !~ /^[0-9]+$/) return 0
+      prefix = pair[2] + 0
+      if (pair[2] != prefix "" || prefix < 12 || prefix > 24) return 0
+      if (split(pair[1], octet, ".") != 4) return 0
+      address = 0
+      for (i = 1; i <= 4; i++) {
+        if (octet[i] !~ /^[0-9]+$/ ||
+            (length(octet[i]) > 1 && substr(octet[i], 1, 1) == "0") ||
+            octet[i] > 255) return 0
+        address = address * 256 + octet[i]
+      }
+      block = 2 ^ (32 - prefix)
+      if (address % block != 0) return 0
+      end = address + block - 1
+      return ((address >= 167772160 && end <= 184549375) ||
+              (address >= 2886729728 && end <= 2887778303) ||
+              (address >= 3232235520 && end <= 3232301055))
+    }
+    NR == 1 {
+      if ($0 == "HOST_CONFIG_VERSION=1") schema = 1
+      else if ($0 == "HOST_CONFIG_VERSION=2") schema = 2
+      else bad = 1
+      next
+    }
+    NR == 2 && ($0 == "AUTOSTART=0" || $0 == "AUTOSTART=1") { autostart = 1; next }
+    NR == 3 && schema == 2 && $1 == "DISK_SIZE_BYTES" && NF == 2 && valid_size($2) { size = 1; next }
+    NR == 4 && schema == 2 && $1 == "BRIDGE_POOL_CIDR" && NF == 2 && valid_cidr($2) { cidr = 1; next }
+    NR == 5 && schema == 2 && ($0 == "EXT4_FEATURES=^casefold" || $0 == "EXT4_FEATURES=^has_journal,^casefold") { features = 1; next }
+    NR == 6 && schema == 2 && $0 == "MOUNT_OPTIONS=noatime,nodev" { options = 1; next }
+    { bad = 1 }
+    END {
+      if (bad || !autostart) exit 1
+      if (schema == 1 && NR == 2) exit 0
+      if (schema == 2 && NR == 6 && size && cidr && features && options) exit 0
+      exit 1
+    }
+  ' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+validate_install_sources() {
+  validate_build_id "$INSTALL_BUILD_ID" || die 'install build ID has an unsafe form' 2
+  canonical_positive "$INSTALL_KERNEL_SIZE" || die 'install kernel size is invalid' 2
+  valid_sha256 "$INSTALL_KERNEL_HASH" || die 'install kernel hash is invalid' 2
+  canonical_positive "$INSTALL_CONFIG_SIZE" || die 'default config size is invalid' 2
+  valid_sha256 "$INSTALL_CONFIG_HASH" || die 'default config hash is invalid' 2
+  verify_manifest_file "$INSTALL_KERNEL_SOURCE" \
+    "$INSTALL_KERNEL_SIZE" "$INSTALL_KERNEL_HASH" 0600 \
+    || die 'prepared kernel source has the wrong identity'
+  verify_manifest_file "$INSTALL_CONFIG_SOURCE" \
+    "$INSTALL_CONFIG_SIZE" "$INSTALL_CONFIG_HASH" 0644 \
+    || die 'default config source has the wrong identity'
+  validate_existing_host_config \
+    || die 'existing host config is malformed or unsafe; refusing activation'
+}
+
+stage_install_assets() {
+  validate_install_sources
+  ensure_private_directory "$KERNEL_ROOT" "$DOCKER_ROOT" 'kernel root'
+  INSTALL_KERNEL_FINAL=$KERNEL_ROOT/$INSTALL_BUILD_ID
+  INSTALL_KERNEL_STAGING=$KERNEL_ROOT/$INSTALL_BUILD_ID.staging
+  if path_exists "$INSTALL_KERNEL_FINAL"; then
+    verify_kernel_tree "$INSTALL_KERNEL_FINAL" \
+      || die 'existing staged kernel does not match this package'
+    path_exists "$INSTALL_KERNEL_STAGING" \
+      && die 'kernel staging path exists beside a finalized candidate'
+  else
+    if path_exists "$INSTALL_KERNEL_STAGING"; then
+      verify_kernel_tree "$INSTALL_KERNEL_STAGING" \
+        || die 'kernel staging path exists with unverified content'
+    else
+      bb mkdir "$INSTALL_KERNEL_STAGING" || die 'cannot create kernel staging directory'
+      bb chmod 0700 "$INSTALL_KERNEL_STAGING" \
+        && bb chown 0:0 "$INSTALL_KERNEL_STAGING" \
+        || die 'cannot protect kernel staging directory'
+      bb cp "$INSTALL_KERNEL_SOURCE" "$INSTALL_KERNEL_STAGING/Image.lz4" \
+        || die 'cannot copy prepared kernel image'
+      bb chmod 0600 "$INSTALL_KERNEL_STAGING/Image.lz4" \
+        && bb chown 0:0 "$INSTALL_KERNEL_STAGING/Image.lz4" \
+        || die 'cannot protect staged kernel image'
+      verify_kernel_tree "$INSTALL_KERNEL_STAGING" \
+        || die 'staged kernel image failed verification'
+      sync_path "$INSTALL_KERNEL_STAGING/Image.lz4" \
+        && sync_path "$INSTALL_KERNEL_STAGING" \
+        && sync_path "$KERNEL_ROOT" \
+        || die 'cannot fsync staged kernel image'
+    fi
+    bb mv -T "$INSTALL_KERNEL_STAGING" "$INSTALL_KERNEL_FINAL" \
+      || die 'cannot publish staged kernel image'
+    sync_path "$KERNEL_ROOT" || die 'cannot fsync published kernel image'
+    verify_kernel_tree "$INSTALL_KERNEL_FINAL" \
+      || die 'published kernel image failed verification'
+  fi
+
+  ensure_private_directory "$CONFIG_ROOT" "$DOCKER_ROOT" 'host config directory'
+  if path_exists "$CONFIG_FILE"; then
+    validate_existing_host_config \
+      || die 'existing host config is malformed or unsafe; refusing activation'
+  else
+    TEMP_CONFIG=$CONFIG_ROOT/.host.conf.next.$$
+    path_exists "$TEMP_CONFIG" && die 'host config temporary path already exists'
+    bb cp "$INSTALL_CONFIG_SOURCE" "$TEMP_CONFIG" || die 'cannot copy default host config'
+    bb chmod 0600 "$TEMP_CONFIG" && bb chown 0:0 "$TEMP_CONFIG" \
+      || die 'cannot protect default host config'
+    verify_manifest_file "$TEMP_CONFIG" "$INSTALL_CONFIG_SIZE" "$INSTALL_CONFIG_HASH" 0600 \
+      || die 'default host config copy failed verification'
+    sync_path "$TEMP_CONFIG" || die 'cannot fsync default host config'
+    bb mv -fT "$TEMP_CONFIG" "$CONFIG_FILE" || die 'cannot publish default host config'
+    TEMP_CONFIG=
+    sync_path "$CONFIG_ROOT" || die 'cannot fsync host config directory'
+  fi
+}
+
+verify_required_old_release() {
+  OLD_ROOT=$1
+  [ -d "$OLD_ROOT" ] && [ ! -L "$OLD_ROOT" ] || return 1
+  [ "$(bb stat -c '%u:%g' "$OLD_ROOT" 2>/dev/null || true)" = 0:0 ] || return 1
+  [ -f "$OLD_ROOT/.release-manifest.tsv" ] && [ ! -L "$OLD_ROOT/.release-manifest.tsv" ] \
+    && [ "$(bb stat -c '%u:%g' "$OLD_ROOT/.release-manifest.tsv" 2>/dev/null || true)" = 0:0 ] \
+    && [ "$(bb stat -c '%a' "$OLD_ROOT/.release-manifest.tsv" 2>/dev/null || true)" = 600 ] \
+    || return 1
+  # Keep the predecessor's parser state isolated from the incoming manifest.
+  (validate_manifest "$OLD_ROOT/.release-manifest.tsv" >/dev/null 2>&1 \
+    && verify_tree "$OLD_ROOT" "$OLD_ROOT/.release-manifest.tsv")
+}
+
+read_active_selector() {
+  ACTIVE_RELEASE=none
+  if ! path_exists "$ACTIVE_LINK"; then
+    return 0
+  fi
+  [ -L "$ACTIVE_LINK" ] || return 1
+  ACTIVE_TARGET=$(bb readlink "$ACTIVE_LINK" 2>/dev/null) || return 1
+  case "$ACTIVE_TARGET" in
+    releases/*) ACTIVE_RELEASE=${ACTIVE_TARGET#releases/} ;;
+    "$RELEASES"/*) ACTIVE_RELEASE=${ACTIVE_TARGET#"$RELEASES"/} ;;
+    *) return 1 ;;
+  esac
+  validate_release_name "$ACTIVE_RELEASE" || return 1
+  [ "$ACTIVE_TARGET" = "releases/$ACTIVE_RELEASE" ] ||
+    [ "$ACTIVE_TARGET" = "$RELEASES/$ACTIVE_RELEASE" ] || return 1
+  return 0
+}
+
+read_active() {
+  read_active_selector || return 1
+  [ "$ACTIVE_RELEASE" = none ] && return 0
+  verify_required_old_release "$RELEASES/$ACTIVE_RELEASE"
+}
+
+require_no_daemon() {
+  if path_exists "$RUN_ROOT/docker.pid" || path_exists "$RUN_ROOT/docker.sock"; then
+    return 1
+  fi
+  [ -d "$PROC_ROOT" ] && [ ! -L "$PROC_ROOT" ] || return 1
+  for PROCESS_DIR in "$PROC_ROOT"/[0-9]*; do
+    [ -d "$PROCESS_DIR" ] || continue
+    PROCESS_COMM=$(bb cat "$PROCESS_DIR/comm" 2>/dev/null || true)
+    case "$PROCESS_COMM" in
+      dockerd|containerd|containerd-shim|containerd-shim-runc-v2) return 1 ;;
+    esac
+    PROCESS_EXE=$(bb readlink "$PROCESS_DIR/exe" 2>/dev/null || true)
+    case "$PROCESS_EXE" in
+      "$RELEASES"/*/dockerd|"$RELEASES"/*/containerd|*/containerd-shim-runc-v2) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+read_activation_record() {
+  RECORD_NEW=
+  RECORD_PREVIOUS=
+  [ -f "$ACTIVATION_RECORD" ] && [ ! -L "$ACTIVATION_RECORD" ] || return 1
+  [ "$(bb stat -c '%a' "$ACTIVATION_RECORD" 2>/dev/null || true)" = 600 ] || return 1
+  [ "$(bb stat -c '%u:%g' "$ACTIVATION_RECORD" 2>/dev/null || true)" = 0:0 ] || return 1
+  {
+    IFS= read -r RECORD_LINE_1 || return 1
+    IFS= read -r RECORD_LINE_2 || return 1
+    IFS= read -r RECORD_LINE_3 || return 1
+    if IFS= read -r RECORD_LINE_4; then
+      [ -z "$RECORD_LINE_4" ] || true
+      return 1
+    fi
+  } < "$ACTIVATION_RECORD"
+  [ "$RECORD_LINE_1" = 'ACTIVATION_RECORD_VERSION=1' ] || return 1
+  case "$RECORD_LINE_2" in
+    NEW=*) RECORD_NEW=${RECORD_LINE_2#NEW=} ;;
+    *) return 1 ;;
+  esac
+  case "$RECORD_LINE_3" in
+    PREVIOUS=*) RECORD_PREVIOUS=${RECORD_LINE_3#PREVIOUS=} ;;
+    *) return 1 ;;
+  esac
+  validate_release_name "$RECORD_NEW" || return 1
+  [ "$RECORD_PREVIOUS" = none ] || validate_release_name "$RECORD_PREVIOUS" || return 1
+  return 0
+}
+
+write_activation_record() {
+  RECORD_WRITE_NEW=$1
+  RECORD_WRITE_PREVIOUS=$2
+  TEMP_RECORD=$RELEASES/.activation.next.$$
+  path_exists "$TEMP_RECORD" && return 1
+  (umask 077; printf '%s\n' \
+    'ACTIVATION_RECORD_VERSION=1' \
+    "NEW=$RECORD_WRITE_NEW" \
+    "PREVIOUS=$RECORD_WRITE_PREVIOUS" > "$TEMP_RECORD") || return 1
+  bb chmod 0600 "$TEMP_RECORD" && bb chown 0:0 "$TEMP_RECORD" || return 1
+  sync_path "$TEMP_RECORD" || return 1
+  bb mv -fT "$TEMP_RECORD" "$ACTIVATION_RECORD" || return 1
+  TEMP_RECORD=
+  sync_path "$RELEASES" || return 1
+  return 0
+}
+
+replace_active_link() {
+  REPLACE_WITH=$1
+  TEMP_LINK=$DOCKER_ROOT/.bin.next.$$
+  path_exists "$TEMP_LINK" && return 1
+  bb ln -s "releases/$REPLACE_WITH" "$TEMP_LINK" || return 1
+  sync_path "$DOCKER_ROOT" || return 1
+  bb mv -fT "$TEMP_LINK" "$ACTIVE_LINK" || return 1
+  TEMP_LINK=
+  sync_path "$DOCKER_ROOT" || return 1
+  read_active_selector && [ "$ACTIVE_RELEASE" = "$REPLACE_WITH" ]
+}
+
+clear_activation_record() {
+  if path_exists "$ACTIVATION_RECORD"; then
+    [ -f "$ACTIVATION_RECORD" ] && [ ! -L "$ACTIVATION_RECORD" ] || return 1
+    bb rm -f "$ACTIVATION_RECORD" || return 1
+    sync_path "$RELEASES" || return 1
+  fi
+  return 0
+}
+
+read_deactivation_record() {
+  DEACTIVATION_EXPECTED=
+  [ -f "$DEACTIVATION_RECORD" ] && [ ! -L "$DEACTIVATION_RECORD" ] || return 1
+  [ "$(bb stat -c '%a' "$DEACTIVATION_RECORD" 2>/dev/null || true)" = 600 ] || return 1
+  [ "$(bb stat -c '%u:%g' "$DEACTIVATION_RECORD" 2>/dev/null || true)" = 0:0 ] || return 1
+  {
+    IFS= read -r DEACTIVATION_LINE_1 || return 1
+    IFS= read -r DEACTIVATION_LINE_2 || return 1
+    if IFS= read -r DEACTIVATION_LINE_3; then
+      return 1
+    fi
+  } < "$DEACTIVATION_RECORD"
+  [ "$DEACTIVATION_LINE_1" = 'DEACTIVATION_RECORD_VERSION=1' ] || return 1
+  case "$DEACTIVATION_LINE_2" in
+    EXPECTED=*) DEACTIVATION_EXPECTED=${DEACTIVATION_LINE_2#EXPECTED=} ;;
+    *) return 1 ;;
+  esac
+  validate_release_name "$DEACTIVATION_EXPECTED"
+}
+
+write_deactivation_record() {
+  DEACTIVATION_WRITE_EXPECTED=$1
+  TEMP_DEACTIVATION=$RELEASES/.deactivation.next.$$
+  path_exists "$TEMP_DEACTIVATION" && return 1
+  (umask 077; printf '%s\n' \
+    'DEACTIVATION_RECORD_VERSION=1' \
+    "EXPECTED=$DEACTIVATION_WRITE_EXPECTED" > "$TEMP_DEACTIVATION") || return 1
+  bb chmod 0600 "$TEMP_DEACTIVATION" && bb chown 0:0 "$TEMP_DEACTIVATION" || return 1
+  sync_path "$TEMP_DEACTIVATION" || return 1
+  bb mv -fT "$TEMP_DEACTIVATION" "$DEACTIVATION_RECORD" || return 1
+  TEMP_DEACTIVATION=
+  sync_path "$RELEASES"
+}
+
+clear_deactivation_record() {
+  CLEAR_DEACTIVATION_EXPECTED=$1
+  read_deactivation_record || return 1
+  [ "$DEACTIVATION_EXPECTED" = "$CLEAR_DEACTIVATION_EXPECTED" ] || return 1
+  bb rm -f "$DEACTIVATION_RECORD" || return 1
+  if sync_path "$RELEASES"; then
+    return 0
+  fi
+  # The selector removal is already durable, but the journal deletion is not.
+  # Restore exact retry proof before reporting the cleanup failure.
+  write_deactivation_record "$CLEAR_DEACTIVATION_EXPECTED" >/dev/null 2>&1 || true
+  return 1
+}
+
+validate_pending_deactivation() {
+  read_deactivation_record || die 'deactivation record is malformed or unsafe'
+  case "$ACTIVE_RELEASE" in
+    "$DEACTIVATION_EXPECTED")
+      if path_exists "$ACTIVATION_RECORD"; then
+        read_activation_record || die 'activation record is malformed or unsafe'
+        [ "$RECORD_NEW" = "$DEACTIVATION_EXPECTED" ] &&
+          [ "$ACTIVE_RELEASE" = "$RECORD_NEW" ] \
+          || die 'activation record does not describe pending deactivation'
+      fi
+      ;;
+    none)
+      ! path_exists "$ACTIVATION_RECORD" \
+        || die 'inactive deactivation retains an activation record'
+      ;;
+    *) die 'deactivation record does not describe the active release' ;;
+  esac
+}
+
+reconcile_inactive_deactivation() {
+  validate_pending_deactivation
+  [ "$ACTIVE_RELEASE" = none ] \
+    || die 'active deactivation must be resumed explicitly'
+  require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+  sync_path "$DOCKER_ROOT" || die 'cannot persist pending active release removal'
+  clear_deactivation_record "$DEACTIVATION_EXPECTED" \
+    || die 'cannot clear completed deactivation record'
+}
+
+pin_manifest() {
+  PIN_SOURCE=$1
+  [ -f "$PIN_SOURCE" ] && [ ! -L "$PIN_SOURCE" ] \
+    || die 'release manifest must be a regular file'
+  file_hash "$PIN_SOURCE" || die 'cannot hash release manifest'
+  PIN_HASH=$FILE_HASH
+  TEMP_MANIFEST=$RUN_ROOT/.release-manifest.$$
+  path_exists "$TEMP_MANIFEST" && die 'temporary manifest path already exists'
+  bb cp "$PIN_SOURCE" "$TEMP_MANIFEST" || die 'cannot pin release manifest'
+  if ! bb chmod 0600 "$TEMP_MANIFEST" || ! bb chown 0:0 "$TEMP_MANIFEST"; then
+    die 'cannot protect pinned release manifest'
+  fi
+  file_hash "$TEMP_MANIFEST" || die 'cannot hash pinned release manifest'
+  [ "$FILE_HASH" = "$PIN_HASH" ] || die 'release manifest changed while being pinned'
+  sync_path "$TEMP_MANIFEST" || die 'cannot fsync pinned release manifest'
+  PINNED_MANIFEST=$TEMP_MANIFEST
+  validate_manifest "$PINNED_MANIFEST"
+}
+
+rollback_locked() {
+  ROLLBACK_EXPECTED=$1
+  read_activation_record || return 1
+  [ "$RECORD_NEW" = "$ROLLBACK_EXPECTED" ] || return 1
+  # The incoming release may be corrupt - that is one reason this rollback
+  # path exists. Authenticate the selector itself here, then authenticate the
+  # predecessor before and after replacing it.
+  read_active_selector || return 1
+  if [ "$ACTIVE_RELEASE" = "$RECORD_NEW" ]; then
+    if [ "$RECORD_PREVIOUS" = none ]; then
+      bb rm -f "$ACTIVE_LINK" || return 1
+      sync_path "$DOCKER_ROOT" || return 1
+    else
+      verify_required_old_release "$RELEASES/$RECORD_PREVIOUS" || return 1
+      replace_active_link "$RECORD_PREVIOUS" || return 1
+    fi
+  elif [ "$ACTIVE_RELEASE" != "$RECORD_PREVIOUS" ]; then
+    return 1
+  fi
+  read_active || return 1
+  [ "$ACTIVE_RELEASE" = "$RECORD_PREVIOUS" ] || return 1
+  clear_activation_record || return 1
+  return 0
+}
+
+stage_activate() {
+  NEW_RELEASE=$1
+  SOURCE_ROOT=$2
+  SOURCE_MANIFEST=$3
+  EXPECTED_ACTIVE=$4
+  validate_release_name "$NEW_RELEASE" || die 'invalid release version'
+  [ "$EXPECTED_ACTIVE" = none ] || validate_release_name "$EXPECTED_ACTIVE" \
+    || die 'invalid expected active release'
+  pin_manifest "$SOURCE_MANIFEST"
+  SOURCE_MANIFEST=$PINNED_MANIFEST
+  verify_source "$SOURCE_ROOT" "$SOURCE_MANIFEST"
+  require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+  read_active || die 'active release link is malformed or unsafe'
+  if path_exists "$DEACTIVATION_RECORD"; then
+    reconcile_inactive_deactivation
+    read_active || die 'active release link changed during deactivation reconciliation'
+  fi
+  PENDING_ACTIVATION_RECORD=0
+  MATCHED_COMPLETED_RECORD=0
+  if path_exists "$ACTIVATION_RECORD"; then
+    read_activation_record || die 'activation record is malformed or unsafe'
+    if [ "$ACTIVE_RELEASE" = "$RECORD_NEW" ]; then
+      MATCHED_COMPLETED_RECORD=1
+    elif [ "$ACTIVE_RELEASE" = "$RECORD_PREVIOUS" ] &&
+         [ "$RECORD_NEW" = "$NEW_RELEASE" ] &&
+         [ "$RECORD_PREVIOUS" = "$EXPECTED_ACTIVE" ]; then
+      PENDING_ACTIVATION_RECORD=1
+    else
+      die 'an unfinished activation record requires rollback'
+    fi
+  fi
+
+  if [ "$ACTIVE_RELEASE" = "$NEW_RELEASE" ]; then
+    if [ "$EXPECTED_ACTIVE" != "$NEW_RELEASE" ]; then
+      [ "$MATCHED_COMPLETED_RECORD" = 1 ] &&
+        [ "$RECORD_NEW" = "$NEW_RELEASE" ] &&
+        [ "$RECORD_PREVIOUS" = "$EXPECTED_ACTIVE" ] \
+        || die "active release changed: expected $EXPECTED_ACTIVE, found $ACTIVE_RELEASE"
+    fi
+    file_hash "$RELEASES/$NEW_RELEASE/.release-manifest.tsv" \
+      || die 'active release has no readable stored manifest'
+    ACTIVE_MANIFEST_HASH=$FILE_HASH
+    file_hash "$SOURCE_MANIFEST" || die 'cannot recheck pinned release manifest'
+    [ "$FILE_HASH" = "$ACTIVE_MANIFEST_HASH" ] \
+      || die 'active release manifest does not match this package'
+    validate_manifest "$RELEASES/$NEW_RELEASE/.release-manifest.tsv"
+    verify_tree "$RELEASES/$NEW_RELEASE" "$RELEASES/$NEW_RELEASE/.release-manifest.tsv" \
+      || die 'active release does not match its stored manifest'
+    if [ "$INSTALL_ASSETS" = 1 ]; then
+      stage_install_assets
+    fi
+    printf 'result=already-active\nactive=%s\nprevious=%s\n' \
+      "$NEW_RELEASE" "${RECORD_PREVIOUS:-$EXPECTED_ACTIVE}"
+    return 0
+  fi
+  [ "$ACTIVE_RELEASE" = "$EXPECTED_ACTIVE" ] \
+    || die "active release changed: expected $EXPECTED_ACTIVE, found $ACTIVE_RELEASE"
+
+  FINAL_RELEASE=$RELEASES/$NEW_RELEASE
+  STAGING_RELEASE=$RELEASES/$NEW_RELEASE.staging
+  if path_exists "$FINAL_RELEASE"; then
+    path_exists "$STAGING_RELEASE" \
+      && die 'release staging path exists beside a finalized release'
+    file_hash "$FINAL_RELEASE/.release-manifest.tsv" \
+      || die 'existing finalized release has no readable stored manifest'
+    FINAL_MANIFEST_HASH=$FILE_HASH
+    file_hash "$SOURCE_MANIFEST" || die 'cannot recheck pinned release manifest'
+    [ "$FILE_HASH" = "$FINAL_MANIFEST_HASH" ] \
+      || die 'existing finalized release manifest does not match'
+    validate_manifest "$FINAL_RELEASE/.release-manifest.tsv"
+    verify_tree "$FINAL_RELEASE" "$FINAL_RELEASE/.release-manifest.tsv" \
+      || die 'existing finalized release does not match the manifest'
+  else
+    if path_exists "$STAGING_RELEASE"; then
+      file_hash "$STAGING_RELEASE/.release-manifest.tsv" \
+        || die 'release staging path exists with unverified content'
+      STAGING_MANIFEST_HASH=$FILE_HASH
+      file_hash "$SOURCE_MANIFEST" || die 'cannot recheck pinned release manifest'
+      [ "$FILE_HASH" = "$STAGING_MANIFEST_HASH" ] \
+        || die 'release staging manifest does not match this package'
+      validate_manifest "$STAGING_RELEASE/.release-manifest.tsv"
+      verify_tree "$STAGING_RELEASE" "$STAGING_RELEASE/.release-manifest.tsv" \
+        || die 'release staging path exists with unverified content'
+    else
+      bb mkdir "$STAGING_RELEASE" || die 'cannot create release staging directory'
+      if ! bb chmod 0700 "$STAGING_RELEASE" || ! bb chown 0:0 "$STAGING_RELEASE"; then
+        die 'cannot protect release staging directory'
+      fi
+      walk_manifest copy "$STAGING_RELEASE" "$SOURCE_MANIFEST" \
+        || die 'cannot populate and verify release staging directory'
+      bb cp "$SOURCE_MANIFEST" "$STAGING_RELEASE/.release-manifest.tsv" \
+        || die 'cannot store release manifest'
+      if ! bb chmod 0600 "$STAGING_RELEASE/.release-manifest.tsv" ||
+         ! bb chown 0:0 "$STAGING_RELEASE/.release-manifest.tsv"; then
+        die 'cannot protect stored release manifest'
+      fi
+      sync_path "$STAGING_RELEASE/.release-manifest.tsv" \
+        || die 'cannot fsync stored release manifest'
+      verify_tree "$STAGING_RELEASE" "$STAGING_RELEASE/.release-manifest.tsv" \
+        || die 'release staging directory failed final verification'
+      if ! sync_path "$STAGING_RELEASE" || ! sync_path "$RELEASES"; then
+        die 'cannot sync release staging directory'
+      fi
+    fi
+    bb mv -T "$STAGING_RELEASE" "$FINAL_RELEASE" \
+      || die 'cannot publish finalized release directory'
+    sync_path "$RELEASES" || die 'cannot sync finalized release directory'
+    verify_tree "$FINAL_RELEASE" "$FINAL_RELEASE/.release-manifest.tsv" \
+      || die 'finalized release failed post-rename verification'
+  fi
+  file_hash "$FINAL_RELEASE/.release-manifest.tsv" \
+    || die 'cannot bind finalized release manifest before activation'
+  FINAL_MANIFEST_HASH=$FILE_HASH
+
+  if [ "$INSTALL_ASSETS" = 1 ]; then
+    stage_install_assets
+  fi
+
+  require_no_daemon || die 'Docker or containerd appeared before activation'
+  read_active || die 'active release link changed before activation'
+  [ "$ACTIVE_RELEASE" = "$EXPECTED_ACTIVE" ] \
+    || die 'active release changed before activation'
+  if [ "$PENDING_ACTIVATION_RECORD" != 1 ]; then
+    write_activation_record "$NEW_RELEASE" "$EXPECTED_ACTIVE" \
+      || die 'cannot publish activation record'
+  fi
+  if ! replace_active_link "$NEW_RELEASE"; then
+    if rollback_locked "$NEW_RELEASE"; then
+      die 'activation failed; previous release was restored'
+    fi
+    die 'activation failed and rollback could not be proved' "$ATTENTION_STATUS"
+  fi
+  if ! file_hash "$FINAL_RELEASE/.release-manifest.tsv" ||
+     [ "$FILE_HASH" != "$FINAL_MANIFEST_HASH" ] ||
+     ! verify_tree "$FINAL_RELEASE" "$FINAL_RELEASE/.release-manifest.tsv"; then
+    if rollback_locked "$NEW_RELEASE"; then
+      die 'activated release failed verification; previous release was restored'
+    fi
+    die 'activated release failed verification and rollback could not be proved' "$ATTENTION_STATUS"
+  fi
+  printf 'result=activated\nactive=%s\nprevious=%s\n' "$NEW_RELEASE" "$EXPECTED_ACTIVE"
+}
+
+rollback_command() {
+  ROLLBACK_EXPECTED=$1
+  validate_release_name "$ROLLBACK_EXPECTED" || die 'invalid expected active release'
+  require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+  ! path_exists "$DEACTIVATION_RECORD" \
+    || die 'pending deactivation must be resumed before rollback'
+  if rollback_locked "$ROLLBACK_EXPECTED"; then
+    printf 'result=rolled-back\nactive=%s\n' "$ACTIVE_RELEASE"
+    return 0
+  fi
+  die 'rollback could not be proved' "$ATTENTION_STATUS"
+}
+
+deactivate_command() {
+  DEACTIVATE_EXPECTED=$1
+  require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+  read_active || die 'active release link is malformed or unsafe'
+  if path_exists "$DEACTIVATION_RECORD"; then
+    validate_pending_deactivation
+    [ "$DEACTIVATION_EXPECTED" = "$DEACTIVATE_EXPECTED" ] \
+      || die 'pending deactivation belongs to a different release'
+    if [ "$ACTIVE_RELEASE" = none ]; then
+      require_no_daemon || die 'Docker or containerd appeared before deactivation reconciliation'
+      sync_path "$DOCKER_ROOT" || die 'cannot persist pending active release removal'
+      clear_deactivation_record "$DEACTIVATE_EXPECTED" \
+        || die 'cannot clear completed deactivation record'
+      printf 'result=deactivated\nactive=none\nprevious=%s\n' "$DEACTIVATE_EXPECTED"
+      return 0
+    fi
+  else
+    [ "$ACTIVE_RELEASE" = "$DEACTIVATE_EXPECTED" ] \
+      || die "active release changed: expected $DEACTIVATE_EXPECTED, found $ACTIVE_RELEASE"
+    if path_exists "$ACTIVATION_RECORD"; then
+      read_activation_record || die 'activation record is malformed or unsafe'
+      [ "$RECORD_NEW" = "$DEACTIVATE_EXPECTED" ] &&
+        [ "$ACTIVE_RELEASE" = "$RECORD_NEW" ] \
+        || die 'activation record does not describe the active release'
+    fi
+    write_deactivation_record "$DEACTIVATE_EXPECTED" \
+      || die 'cannot durably publish deactivation record'
+  fi
+  if path_exists "$ACTIVATION_RECORD"; then
+    read_activation_record || die 'activation record changed before deactivation'
+    [ "$RECORD_NEW" = "$DEACTIVATE_EXPECTED" ] &&
+      [ "$ACTIVE_RELEASE" = "$RECORD_NEW" ] \
+      || die 'activation record changed before deactivation'
+    clear_activation_record || die 'cannot durably clear activation record before deactivation'
+  fi
+  require_no_daemon || die 'Docker or containerd appeared before deactivation'
+  read_active || die 'active release link changed before deactivation'
+  [ "$ACTIVE_RELEASE" = "$DEACTIVATE_EXPECTED" ] \
+    || die 'active release changed before deactivation'
+  bb rm -f "$ACTIVE_LINK" || die 'cannot remove active release link'
+  sync_path "$DOCKER_ROOT" || die 'cannot persist active release removal'
+  read_active_selector && [ "$ACTIVE_RELEASE" = none ] \
+    || die 'active release removal could not be proved' "$ATTENTION_STATUS"
+  clear_deactivation_record "$DEACTIVATE_EXPECTED" \
+    || die 'cannot clear completed deactivation record'
+  printf 'result=deactivated\nactive=none\nprevious=%s\n' "$DEACTIVATE_EXPECTED"
+}
+
+probe_recoverable_bootstrap() {
+  bootstrap_lock_details \
+    || die 'clean-host bootstrap state is present or ambiguous'
+  [ "$BOOTSTRAP_DISK_INTENT" = 1 ] \
+    || die 'clean-host bootstrap has no durable recovery intent'
+  [ ! -d "$PROC_ROOT/$BOOTSTRAP_PID" ] \
+    || die 'another clean-host bootstrap is in progress'
+  # This is deliberately inspection-only. stage-install repeats the complete
+  # checks, wins the stale-owner recovery election, and performs the handoff.
+  validate_partial_bootstrap_layout
+  require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+}
+
+probe_command() {
+  [ "$(bb id -u 2>/dev/null || true)" = 0 ] || die 'root is required' 2
+  require_proc_root
+  if path_exists "$BOOTSTRAP_HANDOFF"; then
+    inspect_bootstrap_handoff
+    printf '%s\n' 'TRANSACTION_PROBE_VERSION=1' 'active=none'
+    return 0
+  fi
+  if path_exists "$BOOTSTRAP_LOCK"; then
+    probe_recoverable_bootstrap
+    printf '%s\n' 'TRANSACTION_PROBE_VERSION=1' 'active=none'
+    return 0
+  fi
+  if ! path_exists "$DOCKER_ROOT"; then
+    require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+    printf '%s\n' 'TRANSACTION_PROBE_VERSION=1' 'active=none'
+    return 0
+  fi
+  require_root_layout
+  require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+  read_active || die 'active release link is malformed or unsafe'
+  if path_exists "$DEACTIVATION_RECORD"; then
+    validate_pending_deactivation
+  fi
+  printf '%s\n' 'TRANSACTION_PROBE_VERSION=1' "active=$ACTIVE_RELEASE"
+}
+
+case "${1:-}" in
+  probe)
+    [ "$#" -eq 1 ] || usage
+    probe_command
+    ;;
+  stage-activate)
+    [ "$#" -eq 5 ] || usage
+    validate_release_name "$2" || die 'invalid release version' 2
+    [ "$5" = none ] || validate_release_name "$5" || die 'invalid expected active release' 2
+    if [ "$5" = none ]; then
+      validate_manifest "$4"
+      verify_source "$3" "$4"
+      require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+      prepare_stage_layout
+    else
+      require_root_layout
+      acquire_lock
+    fi
+    stage_activate "$2" "$3" "$4" "$5"
+    ;;
+  stage-install)
+    [ "$#" -eq 12 ] || usage
+    INSTALL_ASSETS=1
+    INSTALL_BUILD_ID=$6
+    INSTALL_KERNEL_SOURCE=$7
+    INSTALL_KERNEL_SIZE=$8
+    INSTALL_KERNEL_HASH=$9
+    INSTALL_CONFIG_SOURCE=${10}
+    INSTALL_CONFIG_SIZE=${11}
+    INSTALL_CONFIG_HASH=${12}
+    validate_release_name "$2" || die 'invalid release version' 2
+    [ "$5" = none ] || validate_release_name "$5" || die 'invalid expected active release' 2
+    validate_manifest "$4"
+    verify_source "$3" "$4"
+    validate_install_sources
+    require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+    if [ "$5" = none ]; then
+      prepare_stage_layout
+    else
+      require_root_layout
+      acquire_lock
+    fi
+    stage_activate "$2" "$3" "$4" "$5"
+    ;;
+  rollback)
+    [ "$#" -eq 2 ] || usage
+    validate_release_name "$2" || die 'invalid expected active release' 2
+    require_root_layout
+    acquire_lock
+    rollback_command "$2"
+    ;;
+  deactivate)
+    [ "$#" -eq 2 ] || usage
+    validate_release_name "$2" || die 'invalid expected active release' 2
+    require_root_layout
+    require_no_daemon || die 'Docker or containerd state is running or ambiguous'
+    acquire_lock
+    deactivate_command "$2"
+    ;;
+  *) usage ;;
+esac
