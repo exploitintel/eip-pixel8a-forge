@@ -34,6 +34,12 @@ do
     *) sh -n "$shell_file" ;;
   esac
 done
+for shell_file in deployment/*.sh
+do
+  bash -n "$shell_file"
+done
+
+node --test tests/simple-installer.test.mjs
 
 FORGE_JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home} \
   android-app/tools/test-host.sh
