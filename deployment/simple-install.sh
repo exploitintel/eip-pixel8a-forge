@@ -302,7 +302,16 @@ require_fresh_payload() {
 }
 
 start_docker() {
-  phone '/data/docker/bin/hostctl start'
+  local attempt wifi_status
+  for attempt in {1..30}; do
+    wifi_status=$(phone '/data/docker/bin/hostctl status' 2>/dev/null | tr -d '\r' || true)
+    if printf '%s\n' "$wifi_status" | grep -qx 'wifi_interface=ready'; then
+      phone '/data/docker/bin/hostctl start'
+      return
+    fi
+    sleep 2
+  done
+  die 'Wi-Fi did not become ready within 1 minute; connect Wi-Fi and rerun the installer'
 }
 
 enable_control_app() {
