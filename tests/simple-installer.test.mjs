@@ -561,6 +561,14 @@ test("installer rejects missing option values before any device call", (t) => {
   }
 });
 
+test("installer rejects an update-unsafe 8 GiB disk before any device call", (t) => {
+  const item = fixture(t);
+  const result = item.run(["--disk-gib", "8"]);
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /--disk-gib must be 16, 32, or 64/);
+  assert.deepEqual(item.calls(), []);
+});
+
 test("wipe verifies the exact Android target before erasing data", (t) => {
   const item = fixture(t);
   const result = item.run(["--wipe"]);
