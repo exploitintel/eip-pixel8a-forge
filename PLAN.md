@@ -8,10 +8,11 @@ its independently qualified `akita` kernel and boot artifacts.
    Docker networking, and Wi-Fi.
 2. Complete - Forge runtime and control app: port the device-neutral operator runtime and
    Android controller, then prove Web UI, Agent, start, park, and idle parking.
-3. Online delivery: publish Pixel 8a controller and operator images by digest
-   while keeping Forge pinned by `FORGE_REVISION`.
-4. Installer: build the small firmware-preparation and install package for the
-   exact qualified Pixel 8a build, preserving operator state on updates.
+3. In progress - online delivery: the Pixel 8a image workflow is merged; the
+   final images publish from the installer revision after that revision lands.
+4. In progress - installer: the small firmware-preparation and install package
+   targets the exact qualified Pixel 8a build and preserves operator state on
+   updates.
 5. Qualification and release: prove update-to-READY, then after an explicit
    destructive checkpoint prove factory-wipe-to-READY using only the installer.
 

@@ -47,6 +47,22 @@ services reached healthy state, the generated WebUI login authenticated, the
 Agent broker passed Forge's acceptance checks, and the installed control app
 reported `READY`. Provider API keys remain private runtime configuration.
 
+## Install
+
+Download and extract the latest installer bundle from GitHub Releases, then
+follow its included `README.md`. The clean-install path is deliberately small:
+
+```sh
+./prepare-firmware.sh --factory-zip /path/to/akita-cp2a.260805.005-factory-b143bf41.zip --serial ADB_SERIAL
+./install.sh --serial ADB_SERIAL --wipe
+# Complete Android setup, connect Wi-Fi, and authorize USB debugging again.
+./install.sh --serial ADB_SERIAL
+```
+
+The preparation script verifies the exact Google build and downloads the
+pinned public prerequisites. Google firmware and provider credentials are not
+distributed by this repository.
+
 ## Kernel build
 
 Download the exact Google source archive recorded in `DEVICE.json`, then run:
