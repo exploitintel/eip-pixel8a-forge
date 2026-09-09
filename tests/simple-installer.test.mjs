@@ -145,9 +145,9 @@ async function fakeToolMain() {
     const attempts = fs.existsSync(env.FAKE_HOST_STATUS_ATTEMPTS)
       ? Number(fs.readFileSync(env.FAKE_HOST_STATUS_ATTEMPTS, "utf8")) : 0;
     fs.writeFileSync(env.FAKE_HOST_STATUS_ATTEMPTS, `${attempts + 1}\n`);
-    process.stdout.write("schema_version=2\n");
+    process.stdout.write("schema_version=2\r\n");
     process.stdout.write(attempts < Number(env.FAKE_WIFI_DISCONNECTED_CHECKS)
-      ? "wifi_interface=disconnected\n" : "wifi_interface=ready\n");
+      ? "wifi_interface=disconnected\r\n" : "wifi_interface=ready\r\n");
     return;
   }
   if (command === "/data/docker/bin/hostctl start") {

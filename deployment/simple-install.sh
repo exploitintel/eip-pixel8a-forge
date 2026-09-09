@@ -304,7 +304,7 @@ require_fresh_payload() {
 start_docker() {
   local attempt wifi_status
   for attempt in {1..30}; do
-    wifi_status=$(phone '/data/docker/bin/hostctl status' 2>/dev/null || true)
+    wifi_status=$(phone '/data/docker/bin/hostctl status' 2>/dev/null | tr -d '\r' || true)
     if printf '%s\n' "$wifi_status" | grep -qx 'wifi_interface=ready'; then
       phone '/data/docker/bin/hostctl start'
       return
