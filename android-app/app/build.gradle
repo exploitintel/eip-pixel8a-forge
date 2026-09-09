@@ -1,0 +1,38 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.exploitintel.forgecontrol'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'com.exploitintel.forgecontrol'
+        minSdk 31
+        targetSdk 36
+        versionCode 1
+        versionName '0.1.0'
+    }
+
+    signingConfigs {
+        debug {
+            storeFile rootProject.file('.signing/forge-control-debug.jks')
+            storePassword 'android'
+            keyAlias 'forge-control-debug'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

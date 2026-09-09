@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Forge Control</string>
+    <string name="notification_channel_name">Forge protection</string>
+    <string name="notification_channel_description">Shows Forge host state and protects active CVE work.</string>
+    <string name="tile_label">Forge</string>
+    <string name="special_use_fgs_subtype">Protects operator-started CVE work on the local Forge host from CPU suspension, requests a best-effort Wi-Fi lock on the active Wi-Fi transport, and reconciles an operator-requested pending park.</string>
+</resources>

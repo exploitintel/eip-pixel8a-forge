@@ -36,6 +36,17 @@ On the target phone it mounts a labeled sparse ext4 image at
 numeric `wlan0` table, and installs the two bridge policy routes. A fresh
 Alpine container has passed DNS and HTTPS egress over Wi-Fi.
 
+The device-neutral Forge phone runtime and Forge Control Android app live in
+`eip/` and `android-app/`. `FORGE_REVISION` pins the exact standalone Forge v4
+source used to build and deploy the controller. Local Ollama, Ollama Cloud, and
+the other Forge providers remain runtime choices; the phone default is Ollama
+Cloud and no local Ollama binary is installed.
+
+The pinned runtime has been live-qualified on the target phone: both Forge
+services reached healthy state, the generated WebUI login authenticated, the
+Agent broker passed Forge's acceptance checks, and the installed control app
+reported `READY`. Provider API keys remain private runtime configuration.
+
 ## Kernel build
 
 Download the exact Google source archive recorded in `DEVICE.json`, then run:

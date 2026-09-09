@@ -3,10 +3,10 @@
 The Pixel 8a port follows the released Pixel 11 architecture while retaining
 its independently qualified `akita` kernel and boot artifacts.
 
-1. Host lifecycle: port the proven module lifecycle and toolchain, adapt exact
+1. Complete - host lifecycle: port the proven module lifecycle and toolchain, adapt exact
    Pixel 8a identity and storage behavior, then prove start, stop, reboot,
    Docker networking, and Wi-Fi.
-2. Forge runtime and control app: port the device-neutral operator runtime and
+2. Complete - Forge runtime and control app: port the device-neutral operator runtime and
    Android controller, then prove Web UI, Agent, start, park, and idle parking.
 3. Online delivery: publish Pixel 8a controller and operator images by digest
    while keeping Forge pinned by `FORGE_REVISION`.
