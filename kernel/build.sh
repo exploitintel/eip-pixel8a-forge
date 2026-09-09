@@ -47,7 +47,17 @@ done
 [ -d "$patches_dir" ] || fail "patch directory not found: $patches_dir"
 [ ! -e "$out_dir" ] || fail "output already exists: $out_dir"
 command -v docker >/dev/null || fail "Docker is required"
+command -v python3 >/dev/null || fail "python3 is required"
 docker info >/dev/null 2>&1 || fail "Docker daemon is not running"
+
+qualified_image_lz4_sha=$(python3 - "$kernel_dir/../DEVICE.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["kernel"]["qualified_image_lz4_sha256"])
+PY
+) || fail "cannot read the qualified kernel identity"
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/eip-pixel8a-kernel.XXXXXX")
 volume="eip-pixel8a-ksrc-${commit:0:12}"
@@ -131,4 +141,6 @@ fi
 for file in Image Image.lz4 config; do
   printf '%s  %s\n' "$(digest "$out_dir/$file")" "$file"
 done | tee "$out_dir/SHA256SUMS"
+[ "$(digest "$out_dir/Image.lz4")" = "$qualified_image_lz4_sha" ] || \
+  fail "Image.lz4 does not match the qualified Pixel 8a kernel"
 echo "build.sh: completed $expected_release"

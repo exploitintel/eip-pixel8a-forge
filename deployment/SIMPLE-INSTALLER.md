@@ -129,8 +129,8 @@ another build.
 `build-simple-package.sh` creates the release directory from explicit built
 artifacts. Public packages omit Google firmware, Docker Engine, and the
 KernelSU Manager APK; `prepare-firmware.sh` obtains or creates those locally.
-Supplying the optional `--engine`, `--ksu-apk`, `--stock-boot`, and
-`--ksu-init-boot` arguments remains available for operator-local packages.
+Supplying `--engine`, `--ksu-apk`, `--stock-boot`, and `--ksu-init-boot`
+together remains available for operator-local packages.
 
 The builder accepts only the Forge commit in `FORGE_REVISION` and a lock from
 the matching Pixel image-publishing run. Release packages contain immutable
