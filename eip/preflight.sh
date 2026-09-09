@@ -10,8 +10,8 @@ D=/data/docker/bin/docker
 HOST_BIN_DIR=/data/docker/bin
 DOCKER_SOCKET=/data/docker/run/docker.sock
 DOCKER_DATA_ROOT=/data/docker/lib
-DOCKERD_SCRIPT=/data/docker/dockerd.sh
-BOOT_SCRIPT=/data/adb/service.d/docker.sh
+DOCKERD_SCRIPT=/data/docker/bin/dockerd.sh
+BOOT_SCRIPT=/data/adb/modules/eip-pixel8a-forge/boot-completed.sh
 KERNEL_CONFIG=/proc/config.gz
 ZCAT=/system/bin/zcat
 STAT=/system/bin/stat
@@ -221,8 +221,11 @@ else
   else
     ok "Forge state root is populated"
     check_managed_directory "$STATE_ROOT" 750 "Forge state root"
-    for relative in state workspace publish-target run gh ollama kimi-pipeline agent-kimi agent-hermes config; do
+    for relative in state workspace publish-target gh ollama config; do
       check_managed_directory "$STATE_ROOT/$relative" 750 "$relative directory"
+    done
+    for relative in run kimi-pipeline agent-kimi agent-hermes; do
+      check_managed_directory "$STATE_ROOT/$relative" 700 "$relative directory"
     done
     check_managed_directory "$STATE_ROOT/state/managed-skills" 700 "managed-skills directory"
     check_managed_file "$STATE_ROOT/container.env" 644 "container.env"
