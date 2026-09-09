@@ -24,7 +24,7 @@ The module keeps Docker parked by default and provides one lifecycle command:
 
 ```sh
 /data/docker/bin/hostctl status
-/data/docker/bin/hostctl disk-init --size-bytes 8589934592
+/data/docker/bin/hostctl disk-init --size-bytes 17179869184
 /data/docker/bin/hostctl start
 /data/docker/bin/hostctl stop
 /data/docker/bin/hostctl autostart on
@@ -62,6 +62,11 @@ follow its included `README.md`. The clean-install path is deliberately small:
 The preparation script verifies the exact Google build and downloads the
 pinned public prerequisites. Google firmware and provider credentials are not
 distributed by this repository.
+
+Do not accept an Android OTA on an installed Forge phone. A monthly update
+replaces the qualified boot/kernel state, and this exact-build installer will
+refuse an unqualified Android build. Return to the recorded build before
+reinstalling.
 
 ## Kernel build
 

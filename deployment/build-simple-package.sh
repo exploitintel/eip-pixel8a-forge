@@ -59,6 +59,12 @@ if [[ -n "$STOCK_BOOT" || -n "$KSU_INIT_BOOT" ]]; then
   [[ -n "$STOCK_BOOT" && -n "$KSU_INIT_BOOT" ]] || \
     die '--stock-boot and --ksu-init-boot must be supplied together'
 fi
+fresh_inputs=0
+for value in ENGINE STOCK_BOOT KSU_INIT_BOOT KSU_APK; do
+  [[ -z "${!value}" ]] || fresh_inputs=$((fresh_inputs + 1))
+done
+((fresh_inputs == 0 || fresh_inputs == 4)) || \
+  die '--engine, --stock-boot, --ksu-init-boot, and --ksu-apk must be supplied together'
 [[ -d "$FORGE_SOURCE" ]] || die "Forge source is not a directory: $FORGE_SOURCE"
 for file in "$MODULE" "$KERNEL" "$KSU_GRANT_HELPER" "$IMAGE_LOCK" "$APK"; do
   [[ -f "$file" ]] || die "file is missing: $file"
@@ -95,6 +101,18 @@ hash_file() {
   fi
   HASH=${output%% *}
 }
+
+QUALIFIED_KERNEL_SHA256=$(python3 - "$PROJECT_ROOT/DEVICE.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["kernel"]["qualified_image_lz4_sha256"])
+PY
+) || die 'cannot read the qualified kernel identity'
+hash_file "$KERNEL"
+[[ "$HASH" == "$QUALIFIED_KERNEL_SHA256" ]] || \
+  die 'kernel image does not match the qualified Pixel 8a kernel'
 
 PIXEL_REVISION=$(git -C "$PROJECT_ROOT" rev-parse --verify HEAD 2>/dev/null) || \
   die 'cannot resolve Pixel source revision'

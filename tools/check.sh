@@ -39,7 +39,7 @@ do
   bash -n "$shell_file"
 done
 
-node --test tests/simple-installer.test.mjs
+node --test tests/*.test.mjs
 
 FORGE_JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home} \
   android-app/tools/test-host.sh
