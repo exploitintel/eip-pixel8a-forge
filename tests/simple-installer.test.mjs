@@ -141,6 +141,15 @@ async function fakeToolMain() {
     fs.writeFileSync(env.FAKE_STARTED, "started\n");
     return;
   }
+  if (command === "/data/docker/bin/hostctl status") {
+    const attempts = fs.existsSync(env.FAKE_HOST_STATUS_ATTEMPTS)
+      ? Number(fs.readFileSync(env.FAKE_HOST_STATUS_ATTEMPTS, "utf8")) : 0;
+    fs.writeFileSync(env.FAKE_HOST_STATUS_ATTEMPTS, `${attempts + 1}\n`);
+    process.stdout.write("schema_version=2\n");
+    process.stdout.write(attempts < Number(env.FAKE_WIFI_DISCONNECTED_CHECKS)
+      ? "wifi_interface=disconnected\n" : "wifi_interface=ready\n");
+    return;
+  }
   if (command === "/data/docker/bin/hostctl start") {
     fs.writeFileSync(env.FAKE_DOCKER_RUNNING, "running\n");
     return;
@@ -347,6 +356,8 @@ function fixture(t) {
     FAKE_DOCKER_RUNNING: dockerRunning, FAKE_STATUS_MODE: "ready", FAKE_UI_STATUS_MODE: "ready",
     FAKE_EXISTING_INSTALL: "0",
     FAKE_HOST_MODULE_CURRENT: "1",
+    FAKE_HOST_STATUS_ATTEMPTS: path.join(root, "host-status-attempts"),
+    FAKE_WIFI_DISCONNECTED_CHECKS: "0",
     FAKE_PARK_PENDING: path.join(root, "park-pending"), FAKE_PARKED: path.join(root, "parked"),
     FAKE_REDEPLOY_ARGS: path.join(root, "redeploy-args"),
     FAKE_FORGE_STATE_EXISTS: "1",
@@ -680,6 +691,30 @@ test("fresh host installation uses the module, qualified kernel, hostctl, and on
   assert.equal(calls.filter((call) => call.tool === "adb" && call.verb === "reboot"
     && call.command === "").length, 1);
   assert.equal(result.stdout.trim().split("\n").at(-1), "READY");
+});
+
+test("installer waits for Pixel 8a Wi-Fi to reconnect after reboot", (t) => {
+  const item = fixture(t);
+  const result = item.run([], { FAKE_HOST_MODULE_CURRENT: "0", FAKE_WIFI_DISCONNECTED_CHECKS: "2" });
+  assert.equal(result.status, 0, result.stderr);
+  const commands = item.calls().map((call) => call.command).filter(Boolean);
+  assert.equal(commands.filter((command) => command === "/data/docker/bin/hostctl status").length, 3);
+  assert.equal(commands.filter((command) => command === "/data/docker/bin/hostctl start").length, 1);
+  assert.ok(commands.indexOf("/data/docker/bin/hostctl start")
+    > commands.lastIndexOf("/data/docker/bin/hostctl status"));
+  assert.equal(result.stdout.trim().split("\n").at(-1), "READY");
+});
+
+test("installer stops after a bounded wait when Pixel 8a Wi-Fi stays disconnected", (t) => {
+  const item = fixture(t);
+  const result = item.run([], { FAKE_WIFI_DISCONNECTED_CHECKS: "30" });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /Wi-Fi did not become ready within 1 minute/);
+  const commands = item.calls().map((call) => call.command).filter(Boolean);
+  assert.equal(commands.filter((command) => command === "/data/docker/bin/hostctl status").length, 30);
+  assert.ok(!commands.includes("/data/docker/bin/hostctl start"));
+  assert.ok(!commands.some((command) => command.includes("docker pull")));
+  assert.doesNotMatch(result.stdout, /^READY$/m);
 });
 
 for (const suppliedProviders of [false, true]) {
