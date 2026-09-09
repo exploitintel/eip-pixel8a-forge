@@ -1,0 +1,135 @@
+name: Public container images
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the exact Pixel source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out the pinned Forge source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ]
+          forge_revision=$(tr -d '\r\n' < FORGE_REVISION)
+          [[ "$forge_revision" =~ ^[0-9a-f]{40}$ ]]
+          git init .forge
+          git -C .forge remote add origin https://github.com/exploitintel/eip-cve-public-v4.git
+          git -C .forge fetch --depth=1 origin "$forge_revision"
+          git -C .forge checkout --detach FETCH_HEAD
+          [ "$(git -C .forge rev-parse HEAD)" = "$forge_revision" ]
+          git -C .forge archive --format=tar HEAD > /tmp/forge-source.tar
+          printf 'FORGE_REVISION=%s\n' "$forge_revision" >> "$GITHUB_ENV"
+          printf 'FORGE_SOURCE_SHA256=%s\n' "$(sha256sum /tmp/forge-source.tar | cut -d ' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Select the registry-cache BuildKit driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx create --driver docker-container --name eip-registry --use
+          docker buildx inspect --bootstrap
+
+      - name: Build and publish the controller and operator
+        shell: bash
+        run: |
+          set -euo pipefail
+          controller=ghcr.io/exploitintel/eip-pixel8a-forge-controller
+          operator=ghcr.io/exploitintel/eip-pixel8a-forge-operator
+          tag=sha-${GITHUB_SHA::12}
+
+          docker buildx build \
+            --platform linux/arm64 \
+            --build-arg EIP_CVE_UID=2000 \
+            --build-arg EIP_CVE_GID=2000 \
+            --label org.opencontainers.image.source=https://github.com/exploitintel/eip-pixel8a-forge \
+            --label org.opencontainers.image.revision="$FORGE_REVISION" \
+            --label io.exploitintel.build.source-dirty=false \
+            --label io.exploitintel.build.builder-revision="$GITHUB_SHA" \
+            --label io.exploitintel.build.builder-dirty=false \
+            --label io.exploitintel.build.source-snapshot-sha256="sha256:$FORGE_SOURCE_SHA256" \
+            --file .forge/deploy/container/Dockerfile \
+            --target controller \
+            --cache-from "type=registry,ref=$controller:buildcache" \
+            --cache-to "type=registry,ref=$controller:buildcache,mode=max" \
+            --tag "$controller:$tag" \
+            --metadata-file /tmp/controller.json \
+            --push .forge
+
+          docker buildx build \
+            --platform linux/arm64 \
+            --build-arg PIXEL_REVISION="$GITHUB_SHA" \
+            --file eip/Dockerfile.operator \
+            --cache-from "type=registry,ref=$operator:buildcache" \
+            --cache-to "type=registry,ref=$operator:buildcache,mode=max" \
+            --tag "$operator:$tag" \
+            --metadata-file /tmp/operator.json \
+            --push .
+
+          controller_digest=$(jq -r '."containerimage.digest"' /tmp/controller.json)
+          operator_digest=$(jq -r '."containerimage.digest"' /tmp/operator.json)
+          [[ "$controller_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$operator_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          docker pull --platform linux/arm64 "$controller@$controller_digest"
+          docker pull --platform linux/arm64 "$operator@$operator_digest"
+          controller_inspect=$(docker image inspect --format '{{.Id}}|{{.Architecture}}|{{index .Config.Labels "org.opencontainers.image.revision"}}|{{index .Config.Labels "io.exploitintel.build.builder-revision"}}|{{index .Config.Labels "io.exploitintel.build.source-snapshot-sha256"}}' "$controller@$controller_digest")
+          operator_inspect=$(docker image inspect --format '{{.Id}}|{{.Architecture}}|{{index .Config.Labels "org.opencontainers.image.revision"}}' "$operator@$operator_digest")
+          IFS='|' read -r controller_id controller_arch controller_revision controller_builder controller_source <<< "$controller_inspect"
+          IFS='|' read -r operator_id operator_arch operator_revision <<< "$operator_inspect"
+          [ "$controller_arch" = arm64 ]
+          [ "$controller_revision" = "$FORGE_REVISION" ]
+          [ "$controller_builder" = "$GITHUB_SHA" ]
+          [ "$controller_source" = "sha256:$FORGE_SOURCE_SHA256" ]
+          [ "$operator_arch" = arm64 ]
+          [ "$operator_revision" = "$GITHUB_SHA" ]
+          [[ "$controller_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$operator_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          cat > image-lock.env <<EOF
+          LOCK_VERSION=2
+          PIXEL_REVISION=$GITHUB_SHA
+          FORGE_REVISION=$FORGE_REVISION
+          FORGE_SOURCE_SHA256=$FORGE_SOURCE_SHA256
+          CONTROLLER_IMAGE=$controller@$controller_digest
+          CONTROLLER_CONFIG_SHA256=${controller_id#sha256:}
+          OPERATOR_IMAGE=$operator@$operator_digest
+          OPERATOR_CONFIG_SHA256=${operator_id#sha256:}
+          EOF
+
+      - name: Prove anonymous digest pulls
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io
+          anonymous_config=$(mktemp -d)
+          controller=$(sed -n 's/^CONTROLLER_IMAGE=//p' image-lock.env)
+          operator=$(sed -n 's/^OPERATOR_IMAGE=//p' image-lock.env)
+          DOCKER_CONFIG="$anonymous_config" docker pull --platform linux/arm64 "$controller"
+          DOCKER_CONFIG="$anonymous_config" docker pull --platform linux/arm64 "$operator"
+
+      - name: Upload the digest lock
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: image-lock-${{ github.sha }}
+          path: image-lock.env
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 14
