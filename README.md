@@ -1,110 +1,182 @@
-# EIP Pixel 8a Forge
+<p align="center">
+  <a href="https://exploit-intel.com">
+    <img src=".github/assets/eip-hero-banner.svg" alt="Exploit Intelligence Platform" width="100%">
+  </a>
+</p>
 
-Pixel 8a port of the working Pixel 11 Forge architecture. Forge itself remains
-in the standalone `eip-cve-public-v4` repository.
+<h1 align="center">eip-pixel8a-forge</h1>
 
-The supported target is deliberately exact:
+<p align="center"><strong>Run Forge v4 and Docker Engine natively on a Pixel 8a.</strong></p>
 
-- Pixel 8a (`akita`)
-- Android 17 build `CP2A.260805.005`
-- security patch `2026-08-05`
-- Google common 6.1 kernel commit
-  `bd23337e42e794964a89f47596daf1209a25ee1a`
-- KernelSU-Next 3.3.0 in LKM mode
-- Docker Engine 29.8.0 over Wi-Fi
+<p align="center">
+  <a href="https://exploit-intel.com"><img src="https://img.shields.io/badge/Exploit_Intel-platform-34e0a4.svg" alt="Exploit Intelligence Platform"></a>
+  <a href="https://github.com/exploitintel/eip-pixel8a-forge/releases"><img src="https://img.shields.io/github/v/release/exploitintel/eip-pixel8a-forge?include_prereleases&label=release" alt="Latest release"></a>
+  <a href="https://github.com/exploitintel/eip-pixel8a-forge/actions/workflows/check.yml"><img src="https://github.com/exploitintel/eip-pixel8a-forge/actions/workflows/check.yml/badge.svg" alt="Project checks"></a>
+  <a href="https://github.com/exploitintel/eip-pixel8a-forge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-16b8c4.svg" alt="MIT License"></a>
+</p>
 
-`DEVICE.json` records the source, firmware, kernel, boot, KernelSU, and Docker
-identities qualified on the phone. Google firmware, generated boot images,
-Docker data, credentials, and compiled artifacts are intentionally not in Git.
+This repository owns the Pixel host, installer, Forge Control Android app,
+and release packaging. Forge itself remains in
+[`eip-cve-public-v4`](https://github.com/exploitintel/eip-cve-public-v4) and
+is pinned here by [`FORGE_REVISION`](FORGE_REVISION).
 
-## Current state
+**Start here:** [Supported phone](#supported-phone) | [Install](#install) |
+[Update](#update-an-existing-installation) | [What gets installed](#what-gets-installed) |
+[Important limits](#important-limits)
 
-The Docker-capable kernel and managed KernelSU host module are phone-qualified.
-The module keeps Docker parked by default and provides one lifecycle command:
+## Supported phone
 
-```sh
-/data/docker/bin/hostctl status
-/data/docker/bin/hostctl disk-init --size-bytes 17179869184
-/data/docker/bin/hostctl start
-/data/docker/bin/hostctl stop
-/data/docker/bin/hostctl autostart on
-/data/docker/bin/hostctl autostart off
-```
+| Device | Google build | KernelSU-Next | Network |
+| --- | --- | --- | --- |
+| Pixel 8a (`akita`) | Android 17 `CP2A.260805.005` | 3.3.0, LKM | Wi-Fi |
 
-On the target phone it mounts a labeled sparse ext4 image at
-`/data/docker/lib`, runs Docker with `overlay2`, discovers Android's current
-numeric `wlan0` table, and installs the two bridge policy routes. A fresh
-Alpine container has passed DNS and HTTPS egress over Wi-Fi.
-
-The device-neutral Forge phone runtime and Forge Control Android app live in
-`eip/` and `android-app/`. `FORGE_REVISION` pins the exact standalone Forge v4
-source used to build and deploy the controller. Local Ollama, Ollama Cloud, and
-the other Forge providers remain runtime choices; the phone default is Ollama
-Cloud and no local Ollama binary is installed.
-
-The pinned runtime has been live-qualified on the target phone: both Forge
-services reached healthy state, the generated WebUI login authenticated, the
-Agent broker passed Forge's acceptance checks, and the installed control app
-reported `READY`. Provider API keys remain private runtime configuration.
+Other phones and Android builds are not supported by this release.
 
 ## Install
 
-Download and extract the latest installer bundle from GitHub Releases, then
-follow its included `README.md`. The clean-install path is deliberately small:
+You need an unlocked bootloader, a USB cable, and a computer with `adb`,
+`fastboot`, `curl`, and `unzip`. The clean-install path erases the phone.
+
+### 1. Download two files
+
+Download and extract the latest installer bundle from this repository's
+[Releases](https://github.com/exploitintel/eip-pixel8a-forge/releases) page.
+
+Then open Google's official
+[Pixel factory-image page](https://developers.google.com/android/images),
+accept Google's terms, and download the factory ZIP for:
+
+```text
+Pixel 8a (akita)
+CP2A.260805.005
+```
+
+Keep the Google ZIP intact. You do not need to find or rename partition
+images yourself.
+
+### 2. Prepare the Google firmware inputs
+
+With the phone booted, USB debugging enabled, and this computer authorized:
 
 ```sh
-./prepare-firmware.sh --factory-zip /path/to/akita-cp2a.260805.005-factory-b143bf41.zip --serial ADB_SERIAL
+./prepare-firmware.sh \
+  --factory-zip ~/Downloads/akita-cp2a.260805.005-factory-*.zip \
+  --serial ADB_SERIAL
+```
+
+The command extracts and verifies the exact Google boot images, downloads the
+pinned Docker and KernelSU-Next inputs, and creates the local KernelSU bootstrap
+image. Google firmware never enters this repository or its release assets.
+
+### 3. Wipe the phone
+
+Back up anything you need first. This command erases Android user data:
+
+```sh
 ./install.sh --serial ADB_SERIAL --wipe
-# Complete Android setup, connect Wi-Fi, and authorize USB debugging again.
+```
+
+### 4. Finish Android setup and install Forge
+
+Complete Android setup, connect to Wi-Fi, enable USB debugging, and authorize
+the computer again. Then run:
+
+```sh
 ./install.sh --serial ADB_SERIAL
 ```
 
-The preparation script verifies the exact Google build and downloads the
-pinned public prerequisites. Google firmware and provider credentials are not
-distributed by this repository.
-
-Do not accept an Android OTA on an installed Forge phone. A monthly update
-replaces the qualified boot/kernel state, and this exact-build installer will
-refuse an unqualified Android build. Return to the recorded build before
-reinstalling.
-
-## Kernel build
-
-Download the exact Google source archive recorded in `DEVICE.json`, then run:
+To install provider keys at the same time:
 
 ```sh
-kernel/build.sh \
-  --tarball /path/to/kernel-common-bd23337e42e794964a89f47596daf1209a25ee1a.tar.gz \
-  --out kernel/out/CP2A.260805.005
+./install.sh \
+  --serial ADB_SERIAL \
+  --provider-env /path/to/providers.env
 ```
 
-The build uses a Linux Docker volume because the Android kernel source has
-case-distinct filenames that cannot safely share a default macOS filesystem.
+The provider file is ordinary `NAME=value` lines and stays outside the
+repository. For example:
 
-## Module build
+```text
+OLLAMA_API_KEY=replace-me
+OPENAI_API_KEY=replace-me
+ANTHROPIC_API_KEY=replace-me
+DEEPSEEK_API_KEY=replace-me
+GLM_API_KEY=replace-me
+OPENROUTER_API_KEY=replace-me
+```
 
-The module build uses the pinned Bootlin AArch64-musl toolchain in
-`tools/aarch64-musl-toolchain.json`:
+The Docker data image defaults to a sparse 64 GiB allocation. Use
+`--disk-gib 16`, `--disk-gib 32`, or `--disk-gib 64` during a clean install
+when you deliberately want a different size.
+
+Installation is complete only when the final line is:
+
+```text
+READY
+```
+
+The installer prints the generated Forge WebUI username and password
+immediately before `READY`. Save the password for future logins. Open the
+Forge Control app on the phone, then tap **Open Forge WebUI**.
+
+## Update an existing installation
+
+Download and extract the latest installer bundle, connect the already
+installed phone over USB, and run the same command:
 
 ```sh
-tools/build-module-tools.sh \
-  --toolchain-archive /path/to/aarch64--musl--stable-2025.08-1.tar.xz \
-  --out /tmp/eip-pixel8a-module-tools
-
-python3 tools/assemble-module.py --installable \
-  --patch-engine /tmp/eip-pixel8a-module-tools/patch-engine \
-  --swap-boot-kernel /tmp/eip-pixel8a-module-tools/swap-boot-kernel \
-  --privns /tmp/eip-pixel8a-module-tools/privns \
-  --route-policy /tmp/eip-pixel8a-module-tools/route-policy \
-  --toolchain-provenance tools/aarch64-musl-toolchain.json \
-  --musl-license tools/licenses/musl-COPYRIGHT \
-  --output /tmp/eip-pixel8a-forge-module.zip
+./install.sh --serial ADB_SERIAL
 ```
 
-The installer downloads the exact Docker archive recorded in
-`tools/engine.json`; it does not bundle Docker binaries.
+The installer recognizes the existing system, downloads the exact public
+controller and operator image digests over the phone's Wi-Fi connection,
+waits for current Forge work to become idle, and updates with rollback. It
+preserves the Docker disk, Forge state, WebUI password, provider keys, and CVE
+data. Do not run `prepare-firmware.sh`, `--wipe`, or `--disk-gib` for an update.
 
-## Development checks
+## What gets installed
 
-Run `tools/check.sh`. Pull requests also run the same check and a focused
-Claude review. The remaining delivery slices are recorded in `PLAN.md`.
+- The matched Pixel kernel and native Docker host
+- The controller image built from the pinned public Forge commit, pulled from
+  GHCR by immutable digest
+- The Pixel operator image and phone operations
+- Forge Control for starting, parking, and inspecting the system
+- The Forge WebUI and agent-chat service
+
+New installations default Ollama to `https://ollama.com`; no local Ollama
+binary is installed. Local Ollama and every other Forge provider remain
+available through normal Forge configuration.
+
+## Source layout
+
+- `deployment/` contains the installer and package builder.
+- `eip/` contains Pixel-specific Forge and container glue.
+- `android-app/` contains Forge Control.
+- `module/`, `android/`, and `tools/` contain the native Pixel Docker host.
+- `kernel/` contains the qualified kernel recipe, configuration, and source
+  identity.
+- [`DEVICE.json`](DEVICE.json) records the exact firmware, source, boot,
+  KernelSU-Next, and Docker identities qualified on the phone.
+
+Run the source checks with:
+
+```sh
+tools/check.sh
+```
+
+Pull requests run the same checks, focused installer contracts, Android host
+contracts, image validation, and an independent code review.
+
+## Important limits
+
+- The installer writes the active `boot` and `init_boot` partitions.
+- Never use firmware from a different device or build.
+- Keep the matching factory image available for fastboot recovery.
+- Do not accept an Android OTA on an installed Forge phone. Return to the
+  recorded build before reinstalling.
+- Container networking is qualified over Wi-Fi only.
+- Unlocking the bootloader and installing a custom kernel weaken the stock
+  Android security model.
+
+First-party source is MIT licensed. Kernel materials retain their upstream
+licenses. See [`NOTICE.md`](NOTICE.md).
