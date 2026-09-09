@@ -103,7 +103,7 @@ while (($#)); do
 done
 [[ -n "$SERIAL" ]] || die '--serial is required'
 [[ -z "$PROVIDER_ENV" || -f "$PROVIDER_ENV" ]] || die "provider environment is missing: $PROVIDER_ENV"
-case "$DISK_GIB" in 8|16|32|64) ;; *) die '--disk-gib must be 8, 16, 32, or 64' ;; esac
+case "$DISK_GIB" in 16|32|64) ;; *) die '--disk-gib must be 16, 32, or 64' ;; esac
 DISK_BYTES=$((DISK_GIB * 1024 * 1024 * 1024))
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)

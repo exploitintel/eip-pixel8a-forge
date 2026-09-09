@@ -64,8 +64,9 @@ and authorize the computer again. Then run:
 never part of the installer bundle. The installer reports key names and value
 lengths, not secret values.
 
-The Docker data image defaults to a sparse 64 GiB allocation. Select 8, 16,
-32, or 64 GiB with `--disk-gib SIZE`.
+The Docker data image defaults to a sparse 64 GiB allocation. Select 16, 32,
+or 64 GiB with `--disk-gib SIZE`. Smaller images do not leave enough room for
+the old and new Forge controller layers during an update.
 
 ## Update an installed phone
 
