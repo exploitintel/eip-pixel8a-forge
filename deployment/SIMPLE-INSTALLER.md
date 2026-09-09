@@ -138,6 +138,15 @@ installer verifies each downloaded image's config ID before assigning its
 local release tag. It still rechecks the exact prepared boot inputs used by a
 fresh installation.
 
+Build the small Forge Control authorization helper with the Android NDK. Set
+the prebuilt directory to `darwin-x86_64` on macOS or `linux-x86_64` on Linux:
+
+```sh
+"$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$ANDROID_NDK_HOST/bin/aarch64-linux-android34-clang" \
+  -O2 -Wall -Wextra -Werror deployment/ksu-grant-profile.c \
+  -o /tmp/ksu-grant-profile
+```
+
 Focused checks:
 
 ```sh
