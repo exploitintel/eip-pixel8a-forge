@@ -3,6 +3,7 @@
 [`AGENTS.md`](AGENTS.md) is the authoritative instruction file for this
 repository. Read it and the [README](README.md) before changing anything.
 
-Workspace-wide rules live in the `AGENTS.md` beside this repository's parent
-directory. This file exists only so that Claude Code loads them; do not add
-rules, contracts, or repository details here.
+Workspace-wide rules live in the `AGENTS.md` in this repository's parent
+directory, alongside the sibling repositories. This file exists only so that
+Claude Code loads the two above; do not add rules, contracts, or repository
+details here.
