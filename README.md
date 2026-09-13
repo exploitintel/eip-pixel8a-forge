@@ -15,7 +15,7 @@
   <a href="https://github.com/exploitintel/eip-pixel8a-forge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-16b8c4.svg" alt="MIT License"></a>
 </p>
 
-[Forge v4](https://github.com/exploitintel/eip-cve-public-v4) is an
+[EIP CVEForge](https://github.com/exploitintel/eip-cve-public-v4) is an
 operator-controlled CVE research workbench: agents perform source review,
 build isolated labs, do bounded proof work, and prepare reviewed publication
 packages, with a human operator in control at every gate. This repository
