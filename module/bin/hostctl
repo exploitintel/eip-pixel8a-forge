@@ -273,6 +273,7 @@ resolve_active_release() {
 process_argv0_matches() {
   ARGV_PID=$1
   ARGV_EXPECTED=$2
+  [ -x "$TR" ] || die 'tr is unavailable'
   ARGV_FILE=$PROC_ROOT/$ARGV_PID/cmdline
   [ -f "$ARGV_FILE" ] && [ ! -L "$ARGV_FILE" ] || return 1
   ARGV_RAW=$("$TR" '\000' '\n' < "$ARGV_FILE" 2>/dev/null) || return 1
