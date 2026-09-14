@@ -53,6 +53,7 @@ SLEEP=$SYSTEM_BIN/sleep
 STAT=$SYSTEM_BIN/stat
 SHA256SUM=$SYSTEM_BIN/sha256sum
 SYNC=$SYSTEM_BIN/sync
+TR=$SYSTEM_BIN/tr
 TRUNCATE=$SYSTEM_BIN/truncate
 READY_TRIES=30
 STOP_TRIES=30
@@ -274,8 +275,10 @@ process_argv0_matches() {
   ARGV_EXPECTED=$2
   ARGV_FILE=$PROC_ROOT/$ARGV_PID/cmdline
   [ -f "$ARGV_FILE" ] && [ ! -L "$ARGV_FILE" ] || return 1
-  ARGV_ACTUAL=
-  IFS= read -r -d '' ARGV_ACTUAL < "$ARGV_FILE" 2>/dev/null || return 1
+  ARGV_RAW=$("$TR" '\000' '\n' < "$ARGV_FILE" 2>/dev/null) || return 1
+  ARGV_NEWLINE='
+'
+  ARGV_ACTUAL=${ARGV_RAW%%"$ARGV_NEWLINE"*}
   [ -n "$ARGV_ACTUAL" ] && [ "$ARGV_ACTUAL" = "$ARGV_EXPECTED" ]
 }
 

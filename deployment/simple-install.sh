@@ -173,6 +173,34 @@ push() {
   "$ADB_BIN" -s "$SERIAL" push "$1" "$2" >/dev/null
 }
 
+# adb install has been observed to stall indefinitely when the installer runs
+# without a terminal, so every APK install is bounded and retried once.
+APK_INSTALL_TIMEOUT_SECONDS=180
+
+install_apk() {
+  local apk=$1 attempt pid waited
+  for attempt in 1 2; do
+    "$ADB_BIN" -s "$SERIAL" install -r "$apk" >/dev/null </dev/null &
+    pid=$!
+    waited=0
+    while kill -0 "$pid" 2>/dev/null && (( waited < APK_INSTALL_TIMEOUT_SECONDS )); do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"
+      return $?
+    fi
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    if (( attempt == 2 )); then
+      printf 'install: APK install stalled twice, giving up: %s\n' "$apk" >&2
+      return 1
+    fi
+    printf 'install: APK install stalled for %ss, retrying once: %s\n' "$waited" "$apk" >&2
+  done
+}
+
 wait_android() {
   stage 'Waiting for Android to boot' 'Keep USB connected; check that Android boots and USB debugging is authorized.'
   "$ADB_BIN" -s "$SERIAL" wait-for-device
@@ -283,7 +311,7 @@ bootstrap_root() {
   root_available || die 'KernelSU userspace bootstrap did not provide shell root'
 
   stage 'Installing KernelSU Manager' 'Check the APK installation error and available phone storage.'
-  "$ADB_BIN" -s "$SERIAL" install -r "$PAYLOAD/ksu-manager.apk" >/dev/null
+  install_apk "$PAYLOAD/ksu-manager.apk"
   "$ADB_BIN" -s "$SERIAL" shell 'rm -f /data/local/tmp/eip-ksud /data/local/tmp/eip-libadbroot.so; pm grant com.rifsxd.ksunext android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true'
   "$ADB_BIN" -s "$SERIAL" reboot >/dev/null 2>&1 || true
   wait_android
@@ -379,7 +407,7 @@ configure_providers() {
 
 install_control_app() {
   stage 'Installing Forge Control' 'Check the APK installation error and available phone storage.'
-  "$ADB_BIN" -s "$SERIAL" install -r "$PAYLOAD/forge-control.apk" >/dev/null
+  install_apk "$PAYLOAD/forge-control.apk"
 }
 
 stage "Checking root on $SERIAL" 'Check that Android is booted and KernelSU shell root is available.'
