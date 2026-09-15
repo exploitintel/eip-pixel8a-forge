@@ -232,7 +232,7 @@ ensure_engine_archive() {
 # runs from the separately managed /data/docker release tree.
 verify_module_files() {
   local work entry
-  stage 'Verifying the Pixel module bytes' 'Check the module verification output above; Docker stays stopped and existing host state is preserved.'
+  stage 'Verifying the Pixel module bytes' 'Check the module verification output above; only the module tree was being restored, and the Docker daemon runs from the separate /data/docker release tree.'
   work=$(mktemp -d "${TMPDIR:-/tmp}/eip-module.XXXXXX")
   unzip -q "$PAYLOAD/host-module.zip" -d "$work/module" \
     || die 'the payload module archive cannot be extracted'
