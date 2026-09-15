@@ -151,7 +151,7 @@ data. Do not run `prepare-firmware.sh`, `--wipe`, or `--disk-gib` for an update.
 When the payload module version differs from the installed one, the update
 parks Forge, reinstalls the module (fetching and hash-verifying the pinned
 Docker Engine archive when neither the bundle nor the phone holds it), and
-reboots. Every update then proves the installed module tree against the
+reboots. Every update and installation resume then proves the installed
 payload, with the overlay confined to the KernelSU module tree while the
 Docker daemon runs from the separately managed /data/docker release tree:
 the payload files are re-staged through a
