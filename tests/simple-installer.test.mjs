@@ -36,13 +36,25 @@ async function fakeToolMain() {
       ["source-ops.txt", "9".repeat(64)],
     ]);
     const name = [...hashes.keys()].find((candidate) => file?.endsWith(`/${candidate}`));
-    if (!name || args.slice(0, -1).join(" ") !== "-a 256 --") reject();
+    if (!name || args.slice(0, -1).join(" ") !== "-a 256 --") {
+      if (name || !/\/eip-module\.[A-Za-z0-9]+\/module\//.test(file ?? "")) reject();
+      const crypto = await import("node:crypto");
+      const digest = crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+      log({ tool, file, hash: digest });
+      process.stdout.write(`${digest}  ${file}\n`);
+      return;
+    }
     const hash = env.FAKE_BAD_PAYLOAD === name ? "0".repeat(64) : hashes.get(name);
     log({ tool, file, hash });
     process.stdout.write(`${hash}  ${file}\n`);
     return;
   }
   if (tool === "unzip") {
+    if (args[0] === "-q" && args[1]?.endsWith("/payload/host-module.zip") && args[2] === "-d" && args.length === 4) {
+      log({ tool, args: ["-q", "host-module.zip", "-d"] });
+      const extraction = spawnSync("/usr/bin/unzip", args, { encoding: "utf8" });
+      process.exit(extraction.status ?? 96);
+    }
     if (args.length === 3 && args[0] === "-p"
         && args[1].endsWith("/payload/host-module.zip") && args[2] === "module.prop") {
       log({ tool, args });
@@ -79,7 +91,7 @@ async function fakeToolMain() {
     if (rest.length !== 2 || !wrapped.startsWith("su -c '") || !wrapped.endsWith("'")) reject();
     command = wrapped.slice(7, -1).replaceAll("'\\''", "'");
   }
-  log({ tool, verb, command });
+  if (verb !== "push") log({ tool, verb, command });
   if (env.FAKE_FAIL_MATCH && command.includes(env.FAKE_FAIL_MATCH)) {
     process.stderr.write("Injected fixture command failure\n");
     process.exit(Number(env.FAKE_FAIL_STATUS));
@@ -100,6 +112,8 @@ async function fakeToolMain() {
   }
   if (verb === "push" && rest.length === 2) {
     if (!fs.existsSync(rest[0]) || !rest[1].startsWith("/data/local/tmp/")) reject();
+    fs.copyFileSync(rest[0], `${env.FAKE_PUSH_DIR}/${rest[1].split("/").pop()}`);
+    log({ tool, verb, args: rest });
     if (rest[1] === "/data/local/tmp/eip-provider.env") {
       fs.copyFileSync(rest[0], env.FAKE_REMOTE_PROVIDER);
     }
@@ -280,6 +294,7 @@ async function fakeToolMain() {
     "/data/adb/ksud module install /data/local/tmp/eip-pixel8a-forge.zip",
     "KSU=true KSU_VER=3.3.0 KSU_VER_CODE=33214 KSU_RUNTIME_MODE=lkm /data/adb/modules_update/eip-pixel8a-forge/bin/kernelctl install INSTALL:CP2A.260805.005:_a",
     "rm -f /data/local/tmp/docker-29.8.0.tgz /data/local/tmp/Image-CP2A.260805.005.lz4 /data/local/tmp/eip-pixel8a-forge.zip",
+    "test -s /data/local/tmp/docker-29.8.0.tgz",
     "chmod 700 /data/local/tmp/eip-ksud",
     "rm -f /data/local/tmp/eip-ksud /data/local/tmp/eip-ksu-init-boot.img /data/local/tmp/eip-ksu-shell-root.img",
   ]);
@@ -297,22 +312,70 @@ async function fakeToolMain() {
     "chmod 700 /data/local/tmp/eip-ksu-grant-profile;",
     "/data/local/tmp/eip-ksud boot-patch --boot /data/local/tmp/eip-ksu-init-boot.img ",
   ];
+  if (command === "wc -c < /data/local/tmp/docker-29.8.0.tgz; sha256sum /data/local/tmp/docker-29.8.0.tgz") {
+    process.stdout.write(`${env.FAKE_ENGINE_HELD_SIZE ?? "77727467"}\n${env.FAKE_ENGINE_HELD_SHA ?? "1462a696be6029bd478d7d60d7f3c31cdd15affd1178a4a278aaf4a1d1b7f8b5"}  /data/local/tmp/docker-29.8.0.tgz\n`);
+    return;
+  }
+  if (command.startsWith("tar -xf /data/local/tmp/eip-module-files.tar")) {
+    // Reproduce the phone-side proof on the host: extract the pushed overlay
+    // and verify it against the pushed manifest with the same flags.
+    const staged = fs.mkdtempSync(`${env.FAKE_PUSH_DIR}/verify-`);
+    try {
+      const extract = spawnSync("/usr/bin/tar",
+        ["-xf", `${env.FAKE_PUSH_DIR}/eip-module-files.tar`, "-C", staged], { encoding: "utf8" });
+      if (extract.status !== 0) process.exit(1);
+      const check = spawnSync("/bin/bash", ["-c",
+        `cd '${staged.replaceAll("'", "'\\''")}' && sha_helper() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$@"; else sha256sum "$@"; fi; }; sha_helper -c '${env.FAKE_PUSH_DIR}/eip-module-manifest' -s`],
+        { encoding: "utf8", env: { ...env, PATH: "/usr/bin:/bin" } });
+      if (check.status !== 0) process.exit(1);
+    } finally {
+      fs.rmSync(staged, { recursive: true, force: true });
+    }
+    process.exit(Number(env.FAKE_MODULE_VERIFY ?? "0"));
+  }
   if (!exact.has(command) && !prefixes.some((prefix) => command.startsWith(prefix))) reject();
 }
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pixel-simple-installer-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const deployment = path.join(root, "deployment");
   const bin = path.join(root, "bin");
-  const payload = path.join(root, "payload");
+  const payload = path.join(deployment, "payload");
   fs.mkdirSync(bin);
+  fs.mkdirSync(deployment, { recursive: true });
   fs.mkdirSync(payload);
+  const pushDir = path.join(root, "pushed");
+  fs.mkdirSync(pushDir);
   for (const name of ["host-module.zip", "docker-engine.tgz", "kernel.lz4", "stock-boot.img",
     "ksu-init-boot.img", "ksu-manager.apk", "ksu-grant-profile", "forge-control.apk",
     "forge-source.tar", "forge.lock", "ops.tar", "source-ops.tar", "source-ops.txt",
     "install-source-ops-phone.sh", "restore-source-ops-phone.sh", "deployment-manifest.json"]) {
     fs.writeFileSync(path.join(payload, name), "inert installer test payload\n");
   }
+  const moduleStage = path.join(root, "module-stage");
+  fs.mkdirSync(path.join(moduleStage, "bin"), { recursive: true });
+  fs.writeFileSync(path.join(moduleStage, "module.prop"), [
+    "id=eip-pixel8a-forge",
+    "name=EIP Pixel 8a Forge",
+    "version=0.1.0-rc.5",
+    "versionCode=8",
+    "author=Exploit Intel",
+    "description=fixture module",
+    "",
+  ].join("\n"));
+  fs.writeFileSync(path.join(moduleStage, "bin", "hostctl"), "fixture module binary\n");
+  fs.writeFileSync(path.join(moduleStage, "bin", "install-host"), "fixture module binary\n");
+  fs.writeFileSync(path.join(moduleStage, "action.sh"), "fixture module script\n");
+  fs.writeFileSync(path.join(moduleStage, "service.sh"), "fixture module script\n");
+  fs.writeFileSync(path.join(moduleStage, "customize.sh"), "fixture module script\n");
+  fs.writeFileSync(path.join(moduleStage, "uninstall.sh"), "fixture module script\n");
+  const moduleZip = path.join(payload, "host-module.zip");
+  const zipResult = spawnSync("python3", ["-m", "zipfile", "-c", moduleZip,
+    "module.prop", "bin", "action.sh", "service.sh", "customize.sh", "uninstall.sh"],
+    { cwd: moduleStage, encoding: "utf8" });
+  assert.ifError(zipResult.error);
+  assert.equal(zipResult.status, 0, zipResult.stderr);
   fs.writeFileSync(path.join(payload, "redeploy.sh"),
     '#!/bin/bash\nprintf "%s\\n" "$*" >"$FAKE_REDEPLOY_ARGS"\ntouch "$FAKE_STARTED"\n', { mode: 0o755 });
   const controllerConfig = `sha256:${"d".repeat(64)}`;
@@ -326,7 +389,9 @@ function fixture(t) {
     + `CONTROLLER_CONFIG_SHA256=${controllerConfig.slice("sha256:".length)}\n`
     + `OPERATOR_IMAGE=ghcr.io/exploitintel/eip-pixel8a-forge-operator@sha256:${"b".repeat(64)}\n`
     + `OPERATOR_CONFIG_SHA256=${operatorConfig.slice("sha256:".length)}\n`);
-  const script = path.join(root, "install.sh");
+  fs.mkdirSync(path.join(root, "tools"));
+  fs.copyFileSync(new URL("../tools/engine.json", import.meta.url), path.join(root, "tools", "engine.json"));
+  const script = path.join(deployment, "install.sh");
   fs.copyFileSync(installer, script);
   const mock = path.join(root, "fake-tool.mjs");
   fs.writeFileSync(mock, `(${fakeToolMain.toString()})();\n`);
@@ -355,7 +420,7 @@ function fixture(t) {
     FAKE_STARTED: path.join(root, "started"), FAKE_UI_STARTED: path.join(root, "ui-started"),
     FAKE_DOCKER_RUNNING: dockerRunning, FAKE_STATUS_MODE: "ready", FAKE_UI_STATUS_MODE: "ready",
     FAKE_EXISTING_INSTALL: "0",
-    FAKE_HOST_MODULE_CURRENT: "1",
+    FAKE_HOST_MODULE_CURRENT: "1", FAKE_PUSH_DIR: pushDir,
     FAKE_HOST_STATUS_ATTEMPTS: path.join(root, "host-status-attempts"),
     FAKE_WIFI_DISCONNECTED_CHECKS: "0",
     FAKE_PARK_PENDING: path.join(root, "park-pending"), FAKE_PARKED: path.join(root, "parked"),
@@ -504,7 +569,7 @@ test("existing-install update preserves the disk and uses the transactional rele
 test("existing-install update does not require fresh-install firmware or host payloads", (t) => {
   const item = fixture(t);
   for (const name of ["docker-engine.tgz", "stock-boot.img", "ksu-init-boot.img", "ksu-manager.apk"]) {
-    fs.rmSync(path.join(item.root, "payload", name));
+    fs.rmSync(path.join(item.root, "deployment", "payload", name));
   }
   const result = item.run([], { FAKE_EXISTING_INSTALL: "1" });
   assert.equal(result.status, 0, result.stderr);
@@ -848,4 +913,62 @@ test("interrupting a quiet operation reports its stage and does not claim comple
   assert.match(result.stderr, /(?:exit|status|code)[^\n]*130/i);
   assert.match(result.stderr, /(?:failed|failure)[^\n]*(?:source|Forge)|(?:source|Forge)[^\n]*(?:failed|failure)/i);
   expectNoCompletion(result, item.calls());
+});
+
+test("module change update installs, reboots, and proves installed module bytes", (t) => {
+  const item = fixture(t);
+  const result = item.run([], { FAKE_EXISTING_INSTALL: "1", FAKE_HOST_MODULE_CURRENT: "0" });
+  assert.equal(result.status, 0, result.stderr);
+  const commands = item.calls().map((call) => call.command).filter(Boolean);
+  const moduleInstall = commands.indexOf("/data/adb/ksud module install /data/local/tmp/eip-pixel8a-forge.zip");
+  const verifies = commands.map((command, index) => command?.startsWith("tar -xf /data/local/tmp/eip-module-files.tar") ? index : -1).filter((index) => index >= 0);
+  assert.ok(moduleInstall >= 0, "ksud module install must run when the module version changes");
+  assert.ok(verifies.length >= 1, "installed module bytes must be verified against the payload manifest");
+  assert.ok(Math.min(...verifies) > moduleInstall, "verification must follow the module install");
+  const pushes = item.calls().filter((call) => call.tool === "adb" && call.verb === "push")
+    .map((call) => call.args?.at(-1));
+  assert.ok(pushes.includes("/data/local/tmp/eip-module-files.tar"), "the module file overlay must be pushed");
+  assert.ok(pushes.includes("/data/local/tmp/eip-module-manifest"), "the payload checksum manifest must be pushed");
+  assert.equal(result.stdout.trim().split("\n").at(-1), "READY");
+});
+
+test("module-current update still verifies installed bytes after parking", (t) => {
+  const item = fixture(t);
+  const result = item.run([], { FAKE_EXISTING_INSTALL: "1", FAKE_HOST_MODULE_CURRENT: "1" });
+  assert.equal(result.status, 0, result.stderr);
+  const commands = item.calls().map((call) => call.command).filter(Boolean);
+  assert.ok(!commands.includes("/data/adb/ksud module install /data/local/tmp/eip-pixel8a-forge.zip"),
+    "ksud module install must not run when the module version is current");
+  const verify = commands.findIndex((command) => command?.startsWith("tar -xf /data/local/tmp/eip-module-files.tar"));
+  const parkReconcile = commands.indexOf("/data/eip-cve-ops/eip-hostctl.sh reconcile");
+  assert.ok(verify >= 0, "the byte verification must run after parking");
+  assert.ok(verify > parkReconcile, "verification must follow the park");
+  assert.equal(result.stdout.trim().split("\n").at(-1), "READY");
+});
+
+test("module byte verification failure blocks the update with a clear diagnosis", (t) => {
+  const item = fixture(t);
+  const result = item.run([], { FAKE_EXISTING_INSTALL: "1", FAKE_HOST_MODULE_CURRENT: "1", FAKE_MODULE_VERIFY: "1" });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /installed module files do not match the payload/);
+  const failingVerify = item.calls().findIndex((call) => call.command?.startsWith("tar -xf /data/local/tmp/eip-module-files.tar"));
+  assert.ok(failingVerify >= 0);
+  assert.ok(!item.calls().slice(failingVerify).some((call) => call.command === "/data/docker/bin/hostctl start"
+    || call.command?.startsWith("/data/local/tmp/eip-source-ops-")),
+    "Docker must not start again after a failed module verification");
+});
+
+
+test("module change update uses the phone-held engine archive when the bundle omits it", (t) => {
+  const item = fixture(t);
+  fs.rmSync(path.join(item.root, "deployment", "payload", "docker-engine.tgz"));
+  const result = item.run([], { FAKE_EXISTING_INSTALL: "1", FAKE_HOST_MODULE_CURRENT: "0" });
+  assert.equal(result.status, 0, result.stderr);
+  const commands = item.calls().map((call) => call.command).filter(Boolean);
+  assert.ok(commands.includes("test -s /data/local/tmp/docker-29.8.0.tgz"),
+    "the phone-held engine archive must be preferred over a download");
+  assert.ok(!item.calls().some((call) => call.tool === "curl"),
+    "no engine download is needed when the phone already holds the pinned archive");
+  assert.ok(commands.includes("/data/adb/ksud module install /data/local/tmp/eip-pixel8a-forge.zip"));
+  assert.equal(result.stdout.trim().split("\n").at(-1), "READY");
 });

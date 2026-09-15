@@ -180,6 +180,7 @@ IFS='|' read -r LOCK_PIXEL_REVISION LOCK_FORGE_REVISION LOCK_FORGE_SOURCE_SHA256
 mkdir -p "$OUTPUT/payload" "$WORK/ops"
 cp "$SCRIPT_DIR/simple-install.sh" "$OUTPUT/install.sh"
 cp "$SCRIPT_DIR/prepare-firmware.sh" "$OUTPUT/prepare-firmware.sh"
+cp "$PROJECT_ROOT/tools/engine.json" "$OUTPUT/engine.json"
 cp "$SCRIPT_DIR/SIMPLE-INSTALLER.md" "$OUTPUT/README.md"
 cp "$MODULE" "$OUTPUT/payload/host-module.zip"
 if [[ -n "$ENGINE" ]]; then

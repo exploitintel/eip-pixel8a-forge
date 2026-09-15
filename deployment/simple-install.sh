@@ -173,6 +173,71 @@ push() {
   "$ADB_BIN" -s "$SERIAL" push "$1" "$2" >/dev/null
 }
 
+ensure_engine_archive() {
+  local engine_json engine_url engine_name engine_size engine_sha archive held held_size held_sha
+  engine_json=$SCRIPT_DIR/engine.json
+  [[ -f "$engine_json" ]] || engine_json=$SCRIPT_DIR/../tools/engine.json
+  engine_url=
+  engine_name=
+  engine_size=
+  engine_sha=
+  if [[ -f "$engine_json" ]]; then
+    engine_url=$(sed -n 's/.*"url": "\([^"]*\)".*/\1/p' "$engine_json" | head -n 1)
+    engine_name=${engine_url##*/}
+    engine_size=$(sed -n 's/.*"size": \([0-9][0-9]*\).*/\1/p' "$engine_json" | head -n 1)
+    engine_sha=$(sed -n 's/.*"sha256": "\([0-9a-f]\{64\}\)".*/\1/p' "$engine_json" | head -n 1)
+  fi
+  [[ -n "$engine_url" && -n "$engine_size" && -n "$engine_sha" ]] \
+    || die 'cannot read the pinned Docker Engine identity'
+  if phone "test -s /data/local/tmp/$engine_name" >/dev/null 2>&1; then
+    held=$(phone "wc -c < /data/local/tmp/$engine_name; sha256sum /data/local/tmp/$engine_name" 2>/dev/null | tr -d '\r') || held=
+    held_size=$(printf '%s\n' "$held" | sed -n '1s/^[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    held_sha=$(printf '%s\n' "$held" | sed -n '2s/^\([0-9a-f]\{64\}\)  .*/\1/p')
+    if [[ "$held_size" == "$engine_size" && "$held_sha" == "$engine_sha" ]]; then
+      return 0
+    fi
+    printf 'install: the phone-held %s fails the pinned identity; refetching\n' "$engine_name" >&2
+  fi
+  archive=$(mktemp "${TMPDIR:-/tmp}/eip-engine.XXXXXX")
+  curl --fail --location --proto '=https' --proto-redir '=https' \
+    --output "$archive" "$engine_url" \
+    || die 'the pinned Docker Engine archive could not be downloaded'
+  [[ $(wc -c < "$archive" | tr -d ' ') == "$engine_size" ]] \
+    || die 'the pinned Docker Engine archive has the wrong size'
+  verify_file "$archive" "$engine_sha" 'Docker Engine archive'
+  push "$archive" "/data/local/tmp/$engine_name"
+  rm -f "$archive"
+}
+
+# KernelSU's module update can preserve previously installed file bytes
+# (observed on the Pixel 11 Pro XL on 2026-09-15: a new module.prop beside a
+# stale bin/hostctl), so installed module bytes are always re-staged from the
+# payload through a mode-preserving overlay and proven on the phone against a
+# payload-built checksum manifest, with files the payload no longer contains
+# pruned. The overlay touches only the KernelSU module tree; the daemon
+# runs from the separately managed /data/docker release tree.
+verify_module_files() {
+  local work entry
+  stage 'Verifying the Pixel module bytes' 'Check the module verification output above; Docker stays stopped and existing host state is preserved.'
+  work=$(mktemp -d "${TMPDIR:-/tmp}/eip-module.XXXXXX")
+  unzip -q "$PAYLOAD/host-module.zip" -d "$work/module" \
+    || die 'the payload module archive cannot be extracted'
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    hash_file "$work/module/$entry"
+    printf '%s  %s\n' "$FILE_SHA256" "$entry"
+  done < <(cd "$work/module" && LC_ALL=C find . -type f | LC_ALL=C sed 's|^\./||' | LC_ALL=C sort) \
+    > "$work/manifest"
+  LC_ALL=C awk '{ $1 = ""; sub(/^ /, ""); print }' "$work/manifest" > "$work/names"
+  tar -C "$work/module" -cf "$work/files.tar" .
+  push "$work/files.tar" /data/local/tmp/eip-module-files.tar
+  push "$work/manifest" /data/local/tmp/eip-module-manifest
+  push "$work/names" /data/local/tmp/eip-module-names
+  phone 'tar -xf /data/local/tmp/eip-module-files.tar -C /data/adb/modules/eip-pixel8a-forge && chown -R 0:0 /data/adb/modules/eip-pixel8a-forge && cd /data/adb/modules/eip-pixel8a-forge && sha256sum -c /data/local/tmp/eip-module-manifest -s && find . -type f | sed "s|^\\./||" | LC_ALL=C sort | LC_ALL=C comm -23 - /data/local/tmp/eip-module-names | while IFS= read -r stale; do rm -f "$stale"; done; rc=$?; rm -f /data/local/tmp/eip-module-files.tar /data/local/tmp/eip-module-manifest /data/local/tmp/eip-module-names; exit $rc' \
+    || die 'installed module files do not match the payload'
+  rm -rf "$work"
+}
+
 # adb install has been observed to stall indefinitely when the installer runs
 # without a terminal, so every APK install is bounded and retried once.
 APK_INSTALL_TIMEOUT_SECONDS=180
@@ -441,6 +506,8 @@ if [[ "$HOST_MODULE_CURRENT" == false ]]; then
   stage 'Installing the Pixel Docker host' 'Check the module output above, package inputs, USB connection, and available phone storage.'
   if [[ -f "$PAYLOAD/docker-engine.tgz" ]]; then
     push "$PAYLOAD/docker-engine.tgz" /data/local/tmp/docker-29.8.0.tgz
+  else
+    ensure_engine_archive
   fi
   push "$PAYLOAD/kernel.lz4" /data/local/tmp/Image-CP2A.260805.005.lz4
   push "$PAYLOAD/host-module.zip" /data/local/tmp/eip-pixel8a-forge.zip
@@ -457,6 +524,7 @@ if [[ "$HOST_MODULE_CURRENT" == false ]]; then
   phone 'rm -f /data/local/tmp/docker-29.8.0.tgz /data/local/tmp/Image-CP2A.260805.005.lz4 /data/local/tmp/eip-pixel8a-forge.zip'
   "$ADB_BIN" -s "$SERIAL" reboot >/dev/null 2>&1 || true
   wait_android
+  verify_module_files
 elif [[ "$EXISTING_INSTALL" == false ]]; then
   stage 'Preparing Docker storage' 'Check the host storage error above and select the existing disk size if this is a partial installation.'
   phone "/data/docker/bin/hostctl disk-init --size-bytes $DISK_BYTES"
@@ -480,6 +548,9 @@ if [[ "$EXISTING_INSTALL" == true ]]; then
   install_control_app
   stage 'Waiting for current Forge work to finish' 'Forge remains available until its active work is idle; close new work and wait.'
   wait_until_parked
+  if [[ -f "$PAYLOAD/host-module.zip" ]]; then
+    verify_module_files
+  fi
   stage 'Restarting Docker for the update' 'Forge remains parked; check the Docker startup error above.'
   start_docker
   stage 'Installing the matched Forge update' 'Check the source transaction error above; existing state is retained for rollback.'
