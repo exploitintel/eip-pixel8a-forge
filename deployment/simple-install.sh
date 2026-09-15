@@ -233,7 +233,7 @@ verify_module_files() {
   push "$work/files.tar" /data/local/tmp/eip-module-files.tar
   push "$work/manifest" /data/local/tmp/eip-module-manifest
   push "$work/names" /data/local/tmp/eip-module-names
-  phone 'tar -xf /data/local/tmp/eip-module-files.tar -C /data/adb/modules/eip-pixel8a-forge && chown -R 0:0 /data/adb/modules/eip-pixel8a-forge && cd /data/adb/modules/eip-pixel8a-forge && sha256sum -c /data/local/tmp/eip-module-manifest -s && find . -type f | sed "s|^\\./||" | LC_ALL=C sort | LC_ALL=C comm -23 - /data/local/tmp/eip-module-names | while IFS= read -r stale; do rm -f "$stale"; done; rc=$?; rm -f /data/local/tmp/eip-module-files.tar /data/local/tmp/eip-module-manifest /data/local/tmp/eip-module-names; exit $rc' \
+  phone 'tar -xf /data/local/tmp/eip-module-files.tar -C /data/adb/modules/eip-pixel8a-forge && chown -R 0:0 /data/adb/modules/eip-pixel8a-forge && cd /data/adb/modules/eip-pixel8a-forge && /data/adb/ksu/bin/busybox sha256sum -c /data/local/tmp/eip-module-manifest -s && find . -type f | sed "s|^\\./||" | LC_ALL=C sort | LC_ALL=C comm -23 - /data/local/tmp/eip-module-names | while IFS= read -r stale; do case "$stale" in disable|remove|update|skip_mount) continue ;; esac; rm -f "$stale"; done; rc=$?; rm -f /data/local/tmp/eip-module-files.tar /data/local/tmp/eip-module-manifest /data/local/tmp/eip-module-names; exit $rc' \
     || die 'installed module files do not match the payload'
   rm -rf "$work"
 }
