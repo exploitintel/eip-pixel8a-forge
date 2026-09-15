@@ -979,3 +979,28 @@ test("the installer never hardcodes the pinned Docker Engine archive name", () =
   assert.doesNotMatch(source, /docker-29\.8\.0\.tgz/,
     "the archive name must always be derived from the engine.tarball pin");
 });
+
+
+test("engine_archive_name fails closed when the pin is unreadable", (t) => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "pixel-engine-pin-"));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(scratch, "deployment"));
+  fs.copyFileSync(installer, path.join(scratch, "deployment", "install.sh"));
+  const driver = `#!/bin/bash
+set -euo pipefail
+SCRIPT_DIR=\'${scratch}/deployment\'
+source_helpers() { :; }
+eval "$(sed -n '/^engine_tarball_block()/,/^}/p; /^engine_archive_name()/,/^}/p' "$SCRIPT_DIR/install.sh")"
+name=$(engine_archive_name) || exit 3
+[[ -n "$name" ]] || exit 4
+printf 'name=%s\n' "$name"
+`;
+  fs.writeFileSync(path.join(scratch, "driver.sh"), driver, { mode: 0o755 });
+  const result = spawnSync("/bin/bash", [path.join(scratch, "driver.sh")], { encoding: "utf8" });
+  assert.equal(result.status, 3, `missing pin must fail the name helper: ${result.stderr}`);
+  fs.writeFileSync(path.join(scratch, "deployment", "engine.json"),
+    JSON.stringify({ engine: { tarball: { url: "https://example.com/docker-31.0.0.tgz", size: 1, sha256: "0".repeat(64) } } }, null, 2));
+  const healthy = spawnSync("/bin/bash", [path.join(scratch, "driver.sh")], { encoding: "utf8" });
+  assert.equal(healthy.status, 0, healthy.stderr);
+  assert.equal(healthy.stdout.trim(), "name=docker-31.0.0.tgz");
+});

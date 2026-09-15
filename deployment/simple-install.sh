@@ -185,6 +185,7 @@ engine_archive_name() {
   [[ -f "$engine_json" ]] || engine_json=$SCRIPT_DIR/../tools/engine.json
   url=$(engine_tarball_block "$engine_json" 2>/dev/null | sed -n 's/.*"url": "\([^"]*\)".*/\1/p')
   printf '%s' "${url##*/}"
+  [[ -n "$url" ]]
 }
 
 ensure_engine_archive() {
