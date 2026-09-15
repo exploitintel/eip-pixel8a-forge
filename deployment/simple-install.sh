@@ -181,12 +181,10 @@ engine_tarball_block() {
 }
 
 engine_archive_name() {
-  local engine_json=$SCRIPT_DIR/engine.json url name
+  local engine_json=$SCRIPT_DIR/engine.json url
   [[ -f "$engine_json" ]] || engine_json=$SCRIPT_DIR/../tools/engine.json
   url=$(engine_tarball_block "$engine_json" 2>/dev/null | sed -n 's/.*"url": "\([^"]*\)".*/\1/p')
-  name=${url##*/}
-  [[ -n "$name" ]] || die 'cannot read the pinned Docker Engine identity'
-  printf '%s' "$name"
+  printf '%s' "${url##*/}"
 }
 
 ensure_engine_archive() {
@@ -521,7 +519,8 @@ if [[ "$HOST_MODULE_CURRENT" == false ]]; then
   fi
   stage 'Installing the Pixel Docker host' 'Check the module output above, package inputs, USB connection, and available phone storage.'
   if [[ -f "$PAYLOAD/docker-engine.tgz" ]]; then
-    push "$PAYLOAD/docker-engine.tgz" "/data/local/tmp/$(engine_archive_name)"
+    bundled_engine_name=$(engine_archive_name) || die 'cannot read the pinned Docker Engine identity'
+    push "$PAYLOAD/docker-engine.tgz" "/data/local/tmp/$bundled_engine_name"
   else
     ensure_engine_archive
   fi
@@ -537,7 +536,8 @@ if [[ "$HOST_MODULE_CURRENT" == false ]]; then
   case "$slot" in _a|_b) ;; *) die "cannot determine active slot: $slot" ;; esac
   module_root=$(phone 'if test -x /data/adb/modules_update/eip-pixel8a-forge/bin/kernelctl; then printf /data/adb/modules_update/eip-pixel8a-forge; else printf /data/adb/modules/eip-pixel8a-forge; fi' | tr -d '\r')
   phone "KSU=true KSU_VER=3.3.0 KSU_VER_CODE=33214 KSU_RUNTIME_MODE=lkm $module_root/bin/kernelctl install INSTALL:CP2A.260805.005:$slot"
-  phone "rm -f /data/local/tmp/$(engine_archive_name) /data/local/tmp/Image-CP2A.260805.005.lz4 /data/local/tmp/eip-pixel8a-forge.zip"
+  engine_cleanup_name=$(engine_archive_name) || die 'cannot read the pinned Docker Engine identity'
+  phone "rm -f /data/local/tmp/$engine_cleanup_name /data/local/tmp/Image-CP2A.260805.005.lz4 /data/local/tmp/eip-pixel8a-forge.zip"
   "$ADB_BIN" -s "$SERIAL" reboot >/dev/null 2>&1 || true
   wait_android
   verify_module_files
