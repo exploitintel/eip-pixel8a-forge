@@ -181,10 +181,12 @@ engine_tarball_block() {
 }
 
 engine_archive_name() {
-  local engine_json=$SCRIPT_DIR/engine.json url
+  local engine_json=$SCRIPT_DIR/engine.json url name
   [[ -f "$engine_json" ]] || engine_json=$SCRIPT_DIR/../tools/engine.json
-  url=$(engine_tarball_block "$engine_json" | sed -n 's/.*"url": "\([^"]*\)".*/\1/p')
-  printf '%s' "${url##*/}"
+  url=$(engine_tarball_block "$engine_json" 2>/dev/null | sed -n 's/.*"url": "\([^"]*\)".*/\1/p')
+  name=${url##*/}
+  [[ -n "$name" ]] || die 'cannot read the pinned Docker Engine identity'
+  printf '%s' "$name"
 }
 
 ensure_engine_archive() {
@@ -541,6 +543,9 @@ if [[ "$HOST_MODULE_CURRENT" == false ]]; then
   verify_module_files
 elif [[ "$EXISTING_INSTALL" == false ]]; then
   stage 'Preparing Docker storage' 'Check the host storage error above and select the existing disk size if this is a partial installation.'
+  if [[ -f "$PAYLOAD/host-module.zip" ]]; then
+    verify_module_files
+  fi
   phone "/data/docker/bin/hostctl disk-init --size-bytes $DISK_BYTES"
 fi
 
