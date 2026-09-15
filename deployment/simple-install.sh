@@ -173,6 +173,20 @@ push() {
   "$ADB_BIN" -s "$SERIAL" push "$1" "$2" >/dev/null
 }
 
+# The pinned Docker Engine identity is read only from the engine.tarball
+# object; the binaries block carries its own size and sha256 keys and must
+# never satisfy these parses.
+engine_tarball_block() {
+  sed -n '/"tarball": {/,/}/p' "$1"
+}
+
+engine_archive_name() {
+  local engine_json=$SCRIPT_DIR/engine.json url
+  [[ -f "$engine_json" ]] || engine_json=$SCRIPT_DIR/../tools/engine.json
+  url=$(engine_tarball_block "$engine_json" | sed -n 's/.*"url": "\([^"]*\)".*/\1/p')
+  printf '%s' "${url##*/}"
+}
+
 ensure_engine_archive() {
   local engine_json engine_url engine_name engine_size engine_sha archive held held_size held_sha
   engine_json=$SCRIPT_DIR/engine.json
@@ -182,10 +196,10 @@ ensure_engine_archive() {
   engine_size=
   engine_sha=
   if [[ -f "$engine_json" ]]; then
-    engine_url=$(sed -n 's/.*"url": "\([^"]*\)".*/\1/p' "$engine_json" | head -n 1)
+    engine_url=$(engine_tarball_block "$engine_json" | sed -n 's/.*"url": "\([^"]*\)".*/\1/p')
     engine_name=${engine_url##*/}
-    engine_size=$(sed -n 's/.*"size": \([0-9][0-9]*\).*/\1/p' "$engine_json" | head -n 1)
-    engine_sha=$(sed -n 's/.*"sha256": "\([0-9a-f]\{64\}\)".*/\1/p' "$engine_json" | head -n 1)
+    engine_size=$(engine_tarball_block "$engine_json" | sed -n 's/.*"size": \([0-9][0-9]*\).*/\1/p')
+    engine_sha=$(engine_tarball_block "$engine_json" | sed -n 's/.*"sha256": "\([0-9a-f]\{64\}\)".*/\1/p')
   fi
   [[ -n "$engine_url" && -n "$engine_size" && -n "$engine_sha" ]] \
     || die 'cannot read the pinned Docker Engine identity'
@@ -505,7 +519,7 @@ if [[ "$HOST_MODULE_CURRENT" == false ]]; then
   fi
   stage 'Installing the Pixel Docker host' 'Check the module output above, package inputs, USB connection, and available phone storage.'
   if [[ -f "$PAYLOAD/docker-engine.tgz" ]]; then
-    push "$PAYLOAD/docker-engine.tgz" /data/local/tmp/docker-29.8.0.tgz
+    push "$PAYLOAD/docker-engine.tgz" "/data/local/tmp/$(engine_archive_name)"
   else
     ensure_engine_archive
   fi
@@ -521,7 +535,7 @@ if [[ "$HOST_MODULE_CURRENT" == false ]]; then
   case "$slot" in _a|_b) ;; *) die "cannot determine active slot: $slot" ;; esac
   module_root=$(phone 'if test -x /data/adb/modules_update/eip-pixel8a-forge/bin/kernelctl; then printf /data/adb/modules_update/eip-pixel8a-forge; else printf /data/adb/modules/eip-pixel8a-forge; fi' | tr -d '\r')
   phone "KSU=true KSU_VER=3.3.0 KSU_VER_CODE=33214 KSU_RUNTIME_MODE=lkm $module_root/bin/kernelctl install INSTALL:CP2A.260805.005:$slot"
-  phone 'rm -f /data/local/tmp/docker-29.8.0.tgz /data/local/tmp/Image-CP2A.260805.005.lz4 /data/local/tmp/eip-pixel8a-forge.zip'
+  phone "rm -f /data/local/tmp/$(engine_archive_name) /data/local/tmp/Image-CP2A.260805.005.lz4 /data/local/tmp/eip-pixel8a-forge.zip"
   "$ADB_BIN" -s "$SERIAL" reboot >/dev/null 2>&1 || true
   wait_android
   verify_module_files

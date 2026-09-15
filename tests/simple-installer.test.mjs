@@ -972,3 +972,10 @@ test("module change update uses the phone-held engine archive when the bundle om
   assert.ok(commands.includes("/data/adb/ksud module install /data/local/tmp/eip-pixel8a-forge.zip"));
   assert.equal(result.stdout.trim().split("\n").at(-1), "READY");
 });
+
+
+test("the installer never hardcodes the pinned Docker Engine archive name", () => {
+  const source = fs.readFileSync(installer, "utf8");
+  assert.doesNotMatch(source, /docker-29\.8\.0\.tgz/,
+    "the archive name must always be derived from the engine.tarball pin");
+});
