@@ -317,6 +317,14 @@ async function fakeToolMain() {
     return;
   }
   if (command.startsWith("tar -xf /data/local/tmp/eip-module-files.tar")) {
+    // The phone command must parse before anything else: a quoting break in
+    // the assembled string truncated it on a real device and no other check
+    // caught it.
+    const parse = spawnSync("/bin/dash", ["-n"], { input: command, encoding: "utf8" });
+    if (parse.status !== 0) {
+      process.stderr.write(`phone command does not parse: ${parse.stderr}\n`);
+      process.exit(98);
+    }
     // Reproduce the phone-side proof on the host: extract the pushed overlay
     // and verify it against the pushed manifest with the same flags.
     const staged = fs.mkdtempSync(`${env.FAKE_PUSH_DIR}/verify-`);
